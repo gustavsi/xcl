@@ -7498,6 +7498,7 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         super::list_x::on_queue_release(this as usize);
+        super::sparse::forget_queue(this as usize);
     }
     n
 }
@@ -7629,6 +7630,10 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                 } else {
                     super::fence_x::note_queue_wait(a1, a2 as u64);
                     super::list_x::note_title_queue_wait(this as usize, a1, a2 as u64);
+                    let raw_ptr = raw_fence as *mut c_void;
+                    if let Some(fe) = ID3D12Fence::from_raw_borrowed(&raw_ptr) {
+                        super::sparse::note_queue_wait(this as usize, fe.clone(), a2 as u64);
+                    }
                 }
             }
             hr as u32 as usize
@@ -7716,7 +7721,17 @@ unsafe extern "system" fn q_signal_pc(this: *mut c_void, fence: *mut c_void, val
 /// command queue #15 Wait (PC callers)
 unsafe extern "system" fn q_wait_pc(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Wait")));
-    f(this, unwrap_fence(fence), value)
+    let raw = unwrap_fence(fence);
+    let hr = f(this, raw, value);
+    // Only record title fences: XCL's own internal waits (e.g. sparse::before_execute /
+    // vram::before_execute) always have their producer signal already submitted on an internal
+    // queue and must not make readback_after_execute treat the title queue as stalled.
+    if hr >= 0 && is_fence(fence as usize) {
+        if let Some(fe) = ID3D12Fence::from_raw_borrowed(&raw) {
+            super::sparse::note_queue_wait(this as usize, fe.clone(), value);
+        }
+    }
+    hr
 }
 
 /// command queue #23 SignalX(fence, value, flush flags): Signal with the console's cache flush
