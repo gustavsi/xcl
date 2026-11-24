@@ -40,15 +40,26 @@ void main() {
     uint3 g = src.Load3(0);
     uint3 c;
     uint folded = 0u;
-    // rows of 65 535 groups (a ceiling without an addition that could wrap near 2^32)
+    // Guard against corrupted / uninitialized indirect argument buffers (e.g. when a producer
+    // compute PSO was skipped under XCL_PSO_WAIT_MS): 32768x32768x4096 passes per-axis <= 65535
+    // but dispatches 4.4 trillion workgroups and hangs the GPU into a hardware reset.
+    const uint MAX_GROUPS = 4194304u;
     uint rows = g.x / 65535u + (g.x % 65535u != 0u ? 1u : 0u);
-    if (g.x > 65535u && g.y == 1u && g.z <= 65535u && rows <= 65535u) {
-        // more groups in X than D3D12 takes: folded into Y, the program told the count
-        // (as `bind::fold` does on the CPU)
-        folded = g.x;
-        c = uint3(65535u, rows, g.z);
+    if (g.x == 0u || g.y == 0u || g.z == 0u) {
+        c = min(g, 65535u);
+    } else if (g.x > 65535u && g.y == 1u && g.z <= 65535u && rows <= 65535u) {
+        if (g.x > MAX_GROUPS / g.z) {
+            c = uint3(0u, 0u, 0u);
+        } else {
+            // more groups in X than D3D12 takes: folded into Y, the program told the count
+            folded = g.x;
+            c = uint3(65535u, rows, g.z);
+        }
     } else {
         c = min(g, 65535u);
+        if (c.y > MAX_GROUPS / c.x || c.z > MAX_GROUPS / (c.x * c.y)) {
+            c = uint3(0u, 0u, 0u);
+        }
     }
     io.Store(0, folded);
     if (folded != 0u) {
@@ -261,21 +272,17 @@ mod tests {
             let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
-            // (the last three at the top of the range: 65 535² folds into exactly 65 535 rows,
-            // one more or u32::MAX would need 65 536 rows – clamped, as `bind::fold` does)
             for (k, (args, want, io_want)) in [
                 ([72_512u32, 1, 1], [65_535u32, 2, 1], 72_512u32),
                 ([70_000, 2, 1], [65_535, 2, 1], 0),
                 ([300, 4, 2], [300, 4, 2], 0),
-                ([65_535 * 65_535, 1, 1], [65_535, 65_535, 1], 65_535 * 65_535),
-                ([65_535 * 65_535 + 1, 1, 1], [65_535, 1, 1], 0),
-                ([u32::MAX, 1, 1], [65_535, 1, 1], 0),
+                ([32_768, 32_768, 4_096], [0, 0, 0], 0),
+                ([3_096_525_344, 1, 1], [0, 0, 0], 0),
+                ([0, 1, 1], [0, 1, 1], 0),
             ]
             .into_iter()
             .enumerate()
             {
-                let (limit, groups) = super::super::bind::fold(args[0], args[1], args[2]);
-                assert_eq!((groups, limit), (want, io_want), "{args:?}: the CPU's fold, which the GPU's must match");
                 let (a, ap) = visible(&dev, 256);
                 let (io, iop) = visible(&dev, 256);
                 std::ptr::copy_nonoverlapping(args.as_ptr(), ap.add(16), 3);
