@@ -1939,7 +1939,7 @@ pub(super) unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         f(this)
     };
     if n == 0 {
-        release_cleanup(this as usize);
+        release_cleanup_inner(this as usize, held);
     }
     if held {
         super::late_release::hold(this as usize);
@@ -1975,6 +1975,10 @@ unsafe fn foreign_release(this: *mut c_void, f: unsafe extern "system" fn(*mut c
 /// Remove a released resource from XCL's tracking maps.  Runs on a Wine thread only
 /// (from `res_release` or from `late_release::drain_deferred`).
 pub(super) unsafe fn release_cleanup(res: usize) {
+    release_cleanup_inner(res, false);
+}
+
+unsafe fn release_cleanup_inner(res: usize, held: bool) {
     if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
         s.remove(&res);
     }
@@ -1991,8 +1995,11 @@ pub(super) unsafe fn release_cleanup(res: usize) {
         m.remove(&res);
     }
     super::sparse::forget_buffer(res);
-    super::vram::forget(res);
-    super::title_textures::forget(res);
+    let recycle = super::vram::forget_for_recycle(res, held);
+    let final_state = super::title_textures::forget(res);
+    if let (Some(info), Some(state)) = (recycle, final_state) {
+        super::vram::park_recyclable(res, info, state.0 as u32);
+    }
     let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&res));
     if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
         if u.is_sparse(p) {
@@ -3717,7 +3724,7 @@ unsafe fn desc_of(res: *mut c_void) -> Option<D3D12_RESOURCE_DESC> {
     ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc())
 }
 
-unsafe fn note_reserved(hr: HRESULT, ppv: *mut *mut c_void) -> HRESULT {
+pub(super) unsafe fn note_reserved(hr: HRESULT, ppv: *mut *mut c_void) -> HRESULT {
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         if let Some(d) = desc_of(*ppv) {
             RESERVED.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, d);

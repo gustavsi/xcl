@@ -318,6 +318,9 @@ pub unsafe fn drain_known(seal_now: bool) {
     };
     // (outside the lock: a release may end other objects, whose releases come back here)
     for res in gone {
+        if super::vram::recycle_ready(res) {
+            continue;
+        }
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
         f(res as *mut c_void);
     }
