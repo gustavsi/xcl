@@ -3795,6 +3795,149 @@ fn mirrored(va: u64, bytes: usize) -> Option<usize> {
     MIRRORS.lock().unwrap().iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64).map(|&(s, _, m)| m + (va - s) as usize)
 }
 
+/// Per mirror (start, bytes, a bit per 4 KiB page from `start & !0xfff`): pages of its source
+/// the title wrote that a look took off the write-watch (`mirror_pages_written`) and no draw has
+/// copied since. A draw copies these and the pages still on the write-watch (`written_pages`).
+static MIRROR_STALE: Mutex<Vec<(u64, usize, Vec<u64>)>> = Mutex::new(Vec::new());
+/// odd while a look takes pages off the write-watch and has not handed them on yet: a draw
+/// then (or across one) copies its whole range
+static MIRROR_LOOK_SEQ: AtomicU64 = AtomicU64::new(0);
+// the write-watch's answer for a draw's range (one per thread, like `title_textures`' look)
+thread_local! {
+    static WRITTEN_BUF: std::cell::RefCell<Vec<*mut c_void>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The title's ranges with a mirror (start, end), which `title_textures`' look watches.
+pub(super) fn mirror_sources() -> Vec<(usize, usize)> {
+    MIRRORS.lock().unwrap().iter().map(|&(s, l, _)| (s as usize, s as usize + l)).collect()
+}
+
+/// Changes when a mirror is made (`mirror_sources` then has a new range).
+pub(super) fn mirror_sources_gen() -> u64 {
+    MIRROR_BYTES.load(Ordering::Relaxed)
+}
+
+/// A look is about to take written pages off the write-watch.
+pub(super) fn mirror_look_begin() {
+    MIRROR_LOOK_SEQ.fetch_add(1, Ordering::SeqCst);
+}
+
+/// The look took `dirty` (4 KiB pages, sorted) off the write-watch: those in a mirror's
+/// source are copied at the mirror's next draw.
+pub(super) fn mirror_pages_written(dirty: &[usize]) {
+    {
+        let mut g = MIRROR_STALE.lock().unwrap();
+        for (s, l, bits) in g.iter_mut() {
+            let (s, e) = (*s as usize, *s as usize + *l);
+            let first = dirty.partition_point(|&p| p + 0x1000 <= s);
+            for &p in dirty[first..].iter().take_while(|&&p| p < e) {
+                let k = (p - (s & !0xfff)) >> 12;
+                bits[k / 64] |= 1 << (k % 64);
+            }
+        }
+    }
+    MIRROR_LOOK_SEQ.fetch_add(1, Ordering::SeqCst);
+}
+
+/// The pages of `[a, end)` (from `a & !0xfff`, in the mirror of the buffer at `va`) a draw
+/// copies: those on the write-watch (written since the last look) and those a look took off it
+/// since the last copy (whose bits are cleared). None when the range is not write-watched.
+unsafe fn written_pages(va: u64, a: usize, end: usize) -> Option<Vec<bool>> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let base = a & !0xfff;
+    let n = (end - base + 0xfff) >> 12;
+    let mut pages = vec![false; n];
+    WRITTEN_BUF.with(|c| {
+        let mut buf = c.borrow_mut();
+        if buf.len() < n {
+            buf.resize(n, std::ptr::null_mut());
+        }
+        let (mut count, mut granularity) = (n, 0u32);
+        // (no reset: the look's to do, which hands the pages on)
+        if GetWriteWatch(0, base as *const c_void, n << 12, buf.as_mut_ptr(), &mut count, &mut granularity) != 0 || granularity != 0x1000 {
+            return None;
+        }
+        for &p in &buf[..count] {
+            pages[(p as usize - base) >> 12] = true;
+        }
+        Some(())
+    })?;
+    let mut g = MIRROR_STALE.lock().unwrap();
+    if let Some((s, _, bits)) = g.iter_mut().find(|(s, l, _)| va >= *s && end as u64 <= *s + *l as u64) {
+        let first = (base - (*s as usize & !0xfff)) >> 12;
+        for (k, page) in pages.iter_mut().enumerate() {
+            let j = first + k;
+            if bits[j / 64] >> (j % 64) & 1 != 0 {
+                *page = true;
+                bits[j / 64] &= !(1 << (j % 64));
+            }
+        }
+    }
+    Some(pages)
+}
+
+/// For other modules' tests: the title's buffer at `va` mirrored and bound to `list` as its
+/// vertex buffer 0; the mirror's address.
+#[cfg(test)]
+pub(super) unsafe fn bind_mirrored_vertex_buffer(list: *mut c_void, va: u64, bytes: u32, stride: u32) -> *mut u8 {
+    assert_ne!(gpu_va(list, va, bytes as usize, "test vertex buffer", true), va, "the buffer is mirrored");
+    with_bindings(list, |b| {
+        b.vertex_titles.insert(0, (va, bytes, stride));
+    });
+    mirrored(va, bytes as usize).unwrap() as *mut u8
+}
+
+/// For other modules' tests: `list`'s state goes.
+#[cfg(test)]
+pub(super) fn forget_list_for_test(list: *mut c_void) {
+    if let Some(m) = LISTS.lock().unwrap().as_mut() {
+        m.remove(&(list as usize));
+    }
+}
+
+/// `[from, from + len)` of the title's buffer at `va` (`bytes` long) into its mirror at
+/// `mirror`: only the pages the title wrote since they were last copied (#2393), all of it when
+/// the source is not write-watched or a look ran meanwhile.
+///
+/// (No `readable` first – for a range not resident or over 16 pages it walks the region with
+/// `VirtualQuery`, a 1–9 ms stall of the render thread (#2392): the copy cannot fault, and a
+/// page the title freed or protected since keeps what the mirror had.)
+unsafe fn copy_written(va: u64, mirror: usize, bytes: u32, from: u64, len: u64) {
+    let from = from.min(bytes as u64);
+    let len = len.min(bytes as u64 - from) as usize;
+    if len == 0 {
+        return;
+    }
+    let (a, end) = ((va + from) as usize, (va + from) as usize + len);
+    let copy = |lo: usize, hi: usize| {
+        let (lo, hi) = (lo.max(a), hi.min(end));
+        if lo < hi {
+            super::title_textures::copy_committed_region(lo, (mirror + (lo - va as usize)) as *mut u8, hi - lo);
+            sync_count(SYNC_COPIES, 1);
+            sync_count(SYNC_BYTES, (hi - lo) as u64);
+        }
+    };
+    let seq = MIRROR_LOOK_SEQ.load(Ordering::SeqCst);
+    let Some(pages) = (seq % 2 == 0).then(|| written_pages(va, a, end)).flatten() else { return copy(a, end) };
+    let base = a & !0xfff;
+    let mut k = 0;
+    while k < pages.len() {
+        if !pages[k] {
+            k += 1;
+            continue;
+        }
+        let first = k;
+        while k < pages.len() && pages[k] {
+            k += 1;
+        }
+        copy(base + (first << 12), base + (k << 12));
+    }
+    // a look took pages off the write-watch meanwhile, which may not have been handed on yet
+    if MIRROR_LOOK_SEQ.load(Ordering::SeqCst) != seq {
+        copy(a, end);
+    }
+}
+
 /// The mirror address of the title's buffer at `va`; its range's mirror is made (and filled
 /// once) the first time.
 unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
@@ -3824,6 +3967,8 @@ unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
         None => u.alloc(len, 0x1_0000)? as usize,
     };
     std::ptr::copy_nonoverlapping(start as *const u8, p as *mut u8, len);
+    let pages = (((start as usize + len + 0xfff) & !0xfff) - (start as usize & !0xfff)) >> 12;
+    MIRROR_STALE.lock().unwrap().push((start, len, vec![0; pages.div_ceil(64)]));
     g.push((start, len, p));
     let total = MIRROR_BYTES.fetch_add(len as u64, Ordering::Relaxed) + len as u64;
     if g.len() <= 8 || g.len().is_power_of_two() {
@@ -3909,18 +4054,7 @@ unsafe fn sync_mirrors(list: *mut c_void, indexed: Option<(u32, u32, i32)>, firs
         v
     };
     sync_count(SYNC_MIRRORED, 1);
-    // (no `readable` first – for a range not resident or over 16 pages it walks the region with
-    // `VirtualQuery`, a 1–9 ms stall of the render thread (#2392): the copy cannot fault, and a
-    // page the title freed or protected since keeps what the mirror had)
-    let copy = |va: u64, mirror: usize, bytes: u32, from: u64, len: u64| {
-        let from = from.min(bytes as u64);
-        let len = len.min(bytes as u64 - from) as usize;
-        if len > 0 {
-            super::title_textures::copy_committed_region((va + from) as usize, (mirror + from as usize) as *mut u8, len);
-            sync_count(SYNC_COPIES, 1);
-            sync_count(SYNC_BYTES, len as u64);
-        }
-    };
+    let copy = |va: u64, mirror: usize, bytes: u32, from: u64, len: u64| copy_written(va, mirror, bytes, from, len);
     // the vertices read: [lo, hi)
     let (lo, hi) = match (indexed, ib) {
         (Some((first, count, base)), Some((va, bytes, format))) => {
@@ -7736,6 +7870,85 @@ mod tests {
             assert!((0..0x1000).all(|k| *vm.add(k) == 0x22), "the first page is copied");
             assert!((0x1000..0x2000).all(|k| *vm.add(k) == 0x11), "the unreadable page keeps the mirror's bytes");
             assert!((0x2000..0x3000).all(|k| *vm.add(k) == 0x22), "the last page, reached by the last index, is copied");
+            LISTS.lock().unwrap().as_mut().unwrap().remove(&(list as usize));
+            // (the ranges stay allocated: the mirror table is never emptied)
+        }
+    }
+
+    /// The per-draw sync copies only the pages of a write-watched source the title wrote
+    /// (#2393): none after a look found it unchanged; a page written since the look at the next
+    /// draw (still on the write-watch); a page written and then taken off the write-watch by a
+    /// look at the draw after that look (handed on by `mirror_pages_written`). A source that is
+    /// not write-watched is copied at every draw, as before.
+    #[test]
+    fn the_mirror_sync_copies_only_the_pages_the_title_wrote() {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        if crate::gpu::uma::get().is_none() {
+            crate::gpu::recomp::runner::skip_test("no unified memory");
+            return;
+        }
+        unsafe {
+            let (len, bytes, stride) = (0x1_0000usize, 0x3000u32, 16u32);
+            let list = 0x7e57_0000_2393usize as *mut c_void;
+            // a look as `title_textures` makes it: written pages off the write-watch, handed on
+            let look = |src: *mut u8| {
+                mirror_look_begin();
+                let mut buf = vec![std::ptr::null_mut(); len >> 12];
+                let (mut n, mut granularity) = (buf.len(), 0u32);
+                assert_eq!(GetWriteWatch(1, src as *const c_void, len, buf.as_mut_ptr(), &mut n, &mut granularity), 0);
+                let dirty: Vec<usize> = buf[..n].iter().map(|&p| p as usize).collect();
+                mirror_pages_written(&dirty);
+            };
+            // the draw, with the mirror's pages set to `mark` first; again when another test's
+            // look overlapped it (a draw then copies its whole range)
+            let draw = |m: *mut u8, mark: u8| loop {
+                std::ptr::write_bytes(m, mark, bytes as usize);
+                let seq = MIRROR_LOOK_SEQ.load(Ordering::SeqCst);
+                sync_title_buffers(list, None, 0, bytes / stride, 1);
+                if seq % 2 == 0 && MIRROR_LOOK_SEQ.load(Ordering::SeqCst) == seq {
+                    break;
+                }
+            };
+            let page = |m: *mut u8, k: usize| *m.add(k << 12 | 0x123);
+
+            let src = VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) as *mut u8;
+            assert!(!src.is_null());
+            std::ptr::write_bytes(src, 0x11, bytes as usize);
+            assert_ne!(gpu_va(list, src as u64, bytes as usize, "test vertex buffer", true), src as u64);
+            let m = mirrored(src as u64, bytes as usize).unwrap() as *mut u8;
+            with_bindings(list, |b| {
+                b.vertex_titles.insert(0, (src as u64, bytes, stride));
+            });
+            // the title's writes before the mirror was made: on the write-watch until a look,
+            // copied once at the draw after it
+            look(src);
+            draw(m, 0xee);
+            assert_eq!((page(m, 0), page(m, 2)), (0x11, 0x11), "pages written before the look are copied once");
+            draw(m, 0xee);
+            assert_eq!((page(m, 0), page(m, 1), page(m, 2)), (0xee, 0xee, 0xee), "unchanged since: nothing copied");
+            *src.add(0x1000 | 0x123) = 0x22;
+            draw(m, 0xee);
+            assert_eq!((page(m, 0), page(m, 1), page(m, 2)), (0xee, 0x22, 0xee), "the page written since the look is copied");
+            look(src);
+            *src.add(0x2000 | 0x123) = 0x33;
+            look(src);
+            draw(m, 0xee);
+            assert_eq!((page(m, 0), page(m, 2)), (0xee, 0x33), "the page a look took off the write-watch is copied at the next draw");
+            draw(m, 0xee);
+            assert_eq!(page(m, 2), 0xee, "and only once");
+
+            // not write-watched: every draw copies
+            let plain = VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut u8;
+            assert!(!plain.is_null());
+            std::ptr::write_bytes(plain, 0x44, bytes as usize);
+            assert_ne!(gpu_va(list, plain as u64, bytes as usize, "test vertex buffer", true), plain as u64);
+            let pm = mirrored(plain as u64, bytes as usize).unwrap() as *mut u8;
+            with_bindings(list, |b| {
+                b.vertex_titles.insert(0, (plain as u64, bytes, stride));
+            });
+            draw(pm, 0xee);
+            assert_eq!((page(pm, 0), page(pm, 2)), (0x44, 0x44), "a source that is not write-watched is copied");
             LISTS.lock().unwrap().as_mut().unwrap().remove(&(list as usize));
             // (the ranges stay allocated: the mirror table is never emptied)
         }
