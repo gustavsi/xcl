@@ -4459,11 +4459,23 @@ impl Drop for SlotGuard {
 }
 
 static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 0, wanted_most: 0 };
-const GIANT_DRIVER_COMPILE: usize = 4 << 20;
+const GIANT_DRIVER_COMPILE: usize = 2 << 20;
 static GIANT_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1 };
+static PRELOAD_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1 };
+
+fn compile_slots_for(bytes: usize, preload: bool) -> &'static Slots {
+    if preload {
+        &PRELOAD_COMPILES
+    } else if bytes >= GIANT_DRIVER_COMPILE {
+        &GIANT_COMPILES
+    } else {
+        &BIG_COMPILES
+    }
+}
 
 fn compile_slots(bytes: usize) -> &'static Slots {
-    if bytes >= GIANT_DRIVER_COMPILE { &GIANT_COMPILES } else { &BIG_COMPILES }
+    let preload = std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso-pre"));
+    compile_slots_for(bytes, preload)
 }
 
 /// A driver compile of `bytes` of DXIL through `build`: a huge one on an `xcl-pso*` worker
@@ -4664,8 +4676,23 @@ mod big_compile_tests {
 
     #[test]
     fn giant_driver_compiles_have_their_own_lane() {
-        assert!(std::ptr::eq(compile_slots(GIANT_DRIVER_COMPILE - 1), &BIG_COMPILES));
-        assert!(std::ptr::eq(compile_slots(GIANT_DRIVER_COMPILE), &GIANT_COMPILES));
+        assert!(std::ptr::eq(compile_slots_for(GIANT_DRIVER_COMPILE - 1, false), &BIG_COMPILES));
+        assert!(std::ptr::eq(compile_slots_for(GIANT_DRIVER_COMPILE, false), &GIANT_COMPILES));
+    }
+
+    #[test]
+    fn preload_compiles_have_their_own_lane() {
+        assert!(std::ptr::eq(compile_slots_for(GIANT_DRIVER_COMPILE - 1, true), &PRELOAD_COMPILES));
+        assert!(std::ptr::eq(compile_slots_for(GIANT_DRIVER_COMPILE, true), &PRELOAD_COMPILES));
+        let held = big_compile_turn(&PRELOAD_COMPILES, || true, || false);
+        let t0 = Instant::now();
+        let live = std::thread::Builder::new()
+            .name("xcl-pso-live-test".into())
+            .spawn(|| driver_compile("test", huge_pso_bytes(), true, || 9))
+            .unwrap();
+        assert_eq!(live.join().unwrap(), 9);
+        assert!(t0.elapsed() < Duration::from_secs(2), "a stuck preload must not block live workers");
+        drop(held);
     }
 
     #[test]
