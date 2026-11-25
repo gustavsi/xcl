@@ -755,7 +755,6 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return super::pso_async::need_by_submit(raw_pso);
     }
     let pso = super::pso_async::resolve_wait(raw_pso);
-    let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off_title, count_off_title) = (args_off, count_off);
     // where the commands are in unified memory (a console buffer's offsets are the title's)
     let commands_at = super::real::console_buffer(args).map(|(p, n)| (p + args_off as usize, n.saturating_sub(args_off as usize)));

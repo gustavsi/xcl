@@ -2420,7 +2420,11 @@ mod tests {
         unsafe {
             std::ptr::write_bytes(p, 0x5C, 1 << 16);
             with_title_bytes(p as usize, 1 << 16, |b| {
-                assert_eq!(b.as_ptr(), p as *const u8, "the coherent window is read in place");
+                if !crate::util::under_wine() {
+                    assert_eq!(b.as_ptr(), p as *const u8, "the coherent window is read in place");
+                } else {
+                    assert_ne!(b.as_ptr(), p as *const u8, "under Wine the coherent window uses the safe copy");
+                }
                 assert!(b.len() == 1 << 16 && b.iter().all(|&x| x == 0x5C));
             });
         }

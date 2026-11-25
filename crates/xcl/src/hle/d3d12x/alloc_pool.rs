@@ -563,7 +563,10 @@ mod tests {
             if !super::super::real::is_adopted(a) {
                 super::super::real::adopt(a, super::super::real::Kind::CommandAllocator);
             }
-            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let list: ID3D12GraphicsCommandList = {
+                let _g = super::super::real::UnadoptGuard::new(a);
+                dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap()
+            };
             let l = list.as_raw() as usize;
             created_on(l, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
             list.Close().unwrap();
