@@ -269,10 +269,6 @@ pub(super) fn wrapper_of(pc: *mut c_void) -> Option<*mut c_void> {
     WRAPPER_OF.lock().unwrap().as_ref()?.get(&(pc as usize)).map(|&w| w as *mut c_void)
 }
 
-<<<<<<< HEAD
-/// Whether `wrapper` may allocate/activate `n` more split segments for this recording.
-pub(super) fn can_split(wrapper: *mut c_void, n: usize) -> bool {
-=======
 /// The primary PC list behind `wrapper` (`F_PRIMARY`).
 pub(super) unsafe fn primary_of(wrapper: *mut c_void) -> *mut c_void {
     *((wrapper as usize + F_PRIMARY) as *const *mut c_void)
@@ -307,9 +303,8 @@ pub(super) unsafe fn switch_active_for_kickoff(wrapper: *mut c_void, old_active:
     m.insert(new, wrapper as usize);
 }
 
-/// Whether `wrapper` may allocate/activate another split segment for this recording.
-pub(super) fn can_split(wrapper: *mut c_void) -> bool {
->>>>>>> adddb3f6 (Wave 13a: integrate #684, #1860, #2192, #1946, #1803, #2297, #2320, #2333)
+/// Whether `wrapper` may allocate/activate `n` more split segments for this recording.
+pub(super) fn can_split(wrapper: *mut c_void, n: usize) -> bool {
     let sg = SEGMENTS.lock().unwrap();
     sg.as_ref()
         .and_then(|m| m.get(&(wrapper as usize)))
