@@ -650,6 +650,12 @@ fn is_ext_fast(v: usize) -> bool {
     n >= EXT_FAST_CAP && is_ext(v)
 }
 
+/// Whether `UnadoptGuard::new` leaves an object whose vtable is `cur` alone: not an extended
+/// vtable, or a runtime table XCL patched in place (its `ext[-1]` is not the native table).
+fn skips_guard(cur: usize) -> bool {
+    !is_ext_fast(cur) || in_place_original(cur, 0).is_some()
+}
+
 fn register_native(orig: usize) {
     if is_known_native(orig) {
         return;
@@ -684,6 +690,9 @@ unsafe fn vt(obj: *mut c_void) -> *const usize {
 /// Original function of `slot` for an adopted object.
 pub unsafe fn orig_fn(this: *mut c_void, slot: usize) -> usize {
     let ext = vt(this);
+    if let Some(f) = in_place_original(ext as usize, slot) {
+        return f;
+    }
     if crate::util::under_wine() && is_known_native(ext as usize) {
         // Another thread's UnadoptGuard temporarily restored the native vtable on this
         // shared object (e.g. a pipeline state); `ext` is already the original table.
@@ -691,6 +700,81 @@ pub unsafe fn orig_fn(this: *mut c_void, slot: usize) -> usize {
     }
     let orig = *ext.sub(1) as *const usize;
     *orig.add(slot)
+}
+
+// vkd3d-proton takes an object (as `this` of its own methods, or as an argument) only with its own
+// vtable: for heaps, resources, descriptor / query heaps, root signatures, pipeline states and
+// command signatures an assertion, which its release builds keep (the process ends). So under
+// Wine those classes keep their table and XCL's PC slots are written into it (`in_place_kind`), as
+// XAudio2's `patch` does; the entries it had before are kept here for `orig_fn`. Only
+// `class_for`'s Wine branch adds a table, so on Windows the list stays empty and `orig_fn` reads
+// ext[-1] as before.
+
+struct InPlace {
+    table: AtomicUsize,
+    /// the table's first `len` entries before XCL wrote its own
+    saved: AtomicUsize,
+    len: AtomicUsize,
+}
+
+const IN_PLACE_MAX: usize = 32;
+static IN_PLACE: [InPlace; IN_PLACE_MAX] = [const { InPlace { table: AtomicUsize::new(0), saved: AtomicUsize::new(0), len: AtomicUsize::new(0) } }; IN_PLACE_MAX];
+/// entries of `IN_PLACE` in use (published with Release after the entry is written)
+static IN_PLACE_N: AtomicUsize = AtomicUsize::new(0);
+static IN_PLACE_LOCK: Mutex<()> = Mutex::new(());
+
+/// For a vtable patched in place: the runtime's function of `slot` (lock-free: `orig_fn`).
+fn in_place_original(table: usize, slot: usize) -> Option<usize> {
+    let n = IN_PLACE_N.load(Ordering::Acquire);
+    let e = IN_PLACE[..n].iter().find(|e| e.table.load(Ordering::Relaxed) == table)?;
+    let len = e.len.load(Ordering::Relaxed);
+    // SAFETY: `saved` holds `len` entries (leaked); past them the table is the runtime's own
+    Some(unsafe { if slot < len { *(e.saved.load(Ordering::Relaxed) as *const usize).add(slot) } else { *(table as *const usize).add(slot) } })
+}
+
+/// The classes vkd3d-proton checks only by an assertion on their vtable, whose console slots all
+/// sit inside the PC interface: patched in place under Wine. (Not fences: console #12 is past the
+/// PC table's end. Not command allocators and lists: vkd3d-proton checks those at run time, and a
+/// title calls an allocator past its 9 PC methods.)
+fn in_place_kind(kind: Kind) -> bool {
+    matches!(kind, Kind::Heap | Kind::Resource | Kind::DescriptorHeap | Kind::RootSignature | Kind::PipelineState | Kind::QueryHeap | Kind::CommandSignature)
+}
+
+/// Write `entries` over the first `entries.len()` entries of the runtime's vtable `table`, keeping
+/// the ones there for `orig_fn`. `register` (the class into EXTS / CLASSES) runs under the same
+/// lock before the first entry is written, so whatever reaches an XCL entry finds its class.
+/// Ok(false): `table` was patched already (another thread, another kind) – nothing written.
+/// The caller bounds `entries` by the PC interface the object answered for itself.
+unsafe fn patch_in_place(table: *mut usize, entries: &[usize], register: impl FnOnce()) -> Result<bool, String> {
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_READWRITE};
+    let _g = IN_PLACE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let n = IN_PLACE_N.load(Ordering::Acquire);
+    if IN_PLACE[..n].iter().any(|e| e.table.load(Ordering::Relaxed) == table as usize) {
+        return Ok(false);
+    }
+    if n == IN_PLACE_MAX {
+        return Err(format!("more than {IN_PLACE_MAX} vtables"));
+    }
+    let bytes = std::mem::size_of_val(entries);
+    let mut old = 0u32;
+    if VirtualProtect(table as *const c_void, bytes, PAGE_READWRITE, &mut old) == 0 {
+        return Err(format!("VirtualProtect: error {}", windows_sys::Win32::Foundation::GetLastError()));
+    }
+    let saved: &'static [usize] = Box::leak((0..entries.len()).map(|i| table.add(i).read()).collect::<Vec<_>>().into_boxed_slice());
+    let e = &IN_PLACE[n];
+    e.table.store(table as usize, Ordering::Relaxed);
+    e.saved.store(saved.as_ptr() as usize, Ordering::Relaxed);
+    e.len.store(saved.len(), Ordering::Relaxed);
+    IN_PLACE_N.store(n + 1, Ordering::Release);
+    register();
+    for (i, &f) in entries.iter().enumerate() {
+        if saved[i] != f {
+            // other threads call through the table meanwhile: one aligned store per entry
+            (*(table.add(i) as *const AtomicUsize)).store(f, Ordering::Release);
+        }
+    }
+    VirtualProtect(table as *const c_void, bytes, old, &mut old);
+    Ok(true)
 }
 
 fn module_of(addr: usize) -> usize {
@@ -797,7 +881,7 @@ impl UnadoptGuard {
             return Some(Self { obj });
         }
         let cur = (*(obj as *const AtomicUsize)).load(Ordering::Acquire);
-        if !is_ext_fast(cur) {
+        if skips_guard(cur) {
             return None;
         }
         let orig = *(cur as *const usize).sub(1);
@@ -880,6 +964,19 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
 }
 
 unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
+    if in_place_kind(kind) && crate::util::under_wine() {
+        // one class at a time: a thread that scanned the table while another wrote XCL's entries
+        // into it would stop at the first of them and make an extended copy of a table that is
+        // half XCL's (its `orig_fn` would then call XCL's own entries)
+        static MAKING: Mutex<()> = Mutex::new(());
+        let _g = MAKING.lock().unwrap_or_else(|e| e.into_inner());
+        return make_class(obj, orig, kind, true);
+    }
+    make_class(obj, orig, kind, false)
+}
+
+/// `class_for`; `in_place`: the class may get its slots in the runtime's own table (Wine).
+unsafe fn make_class(obj: *mut c_void, orig: usize, kind: Kind, in_place: bool) -> usize {
     if let Some(c) = CLASSES.lock().unwrap().iter().find(|c| c.orig == orig && c.kind == kind) {
         return c.ext;
     }
@@ -889,10 +986,14 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     let qi: QiFn = std::mem::transmute(*ot);
     let release: RefFn = std::mem::transmute(*ot.add(2));
     let mut iface = *chain.last().expect("layout chain");
+    // the object answered for it itself (not another object's table): its table has the
+    // interface's methods
+    let mut own = false;
     for i in &chain {
         let iid = layout::parse_guid(i.iid);
         let mut out = std::ptr::null_mut();
         if qi(obj, &iid, &mut out) >= 0 && !out.is_null() {
+            own = out == obj;
             release(out);
             iface = i;
             break;
@@ -904,14 +1005,18 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     while scanned < public + MAX_SCAN && module_of(*ot.add(scanned)) == m0 {
         scanned += 1;
     }
-    let scanned = scanned.max(public);
     let max_console = console_slots(kind)
         .iter()
         .map(|e| e.0 + 1)
         .chain(console_remap(kind).iter().map(|e| e.0 + 1))
         .max()
         .unwrap_or(0);
-    let total = (scanned + EXTRA_SLOTS).max(max_console);
+    // in place only the PC interface's slots are written: the table's length is known only up to
+    // there (the object's own answer to QueryInterface; each of those slots in the runtime's
+    // module), and nothing XCL puts past it would be reachable
+    let in_place = in_place && own && scanned >= public && max_console <= public;
+    let scanned = if in_place { public } else { scanned.max(public) };
+    let total = if in_place { public } else { (scanned + EXTRA_SLOTS).max(max_console) };
     let mut v: Vec<usize> = Vec::with_capacity(total + 1);
     v.push(orig);
     for i in 0..scanned {
@@ -984,6 +1089,28 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
         for i in 0..public {
             let name = format!("{}::{} (#{i})", iface.name, iface.methods.get(i).copied().unwrap_or("?"));
             v[1 + i] = super::guard::make_tracer(v[1 + i], name);
+        }
+    }
+    if in_place {
+        let register = || {
+            register_ext(orig);
+            CLASSES.lock().unwrap().push(Class { orig, kind, ext: orig, iface, public, scanned });
+        };
+        match patch_in_place(orig as *mut usize, &v[1..], register) {
+            Ok(written) => {
+                if written {
+                    crate::xlog_info!(
+                        "D3D12.X: {} – {public} PC methods written into the runtime's own vtable (Wine: vkd3d-proton checks it; {kind:?}, PC vtable {})",
+                        iface.name,
+                        crate::modules::describe_address(orig)
+                    );
+                }
+                return orig;
+            }
+            Err(e) => {
+                crate::xlog_warn!("D3D12.X: {} – its vtable cannot be written ({e}): an extended copy instead", iface.name);
+                return make_class(obj, orig, kind, false);
+            }
         }
     }
     let leaked: &'static [usize] = Box::leak(v.into_boxed_slice());
@@ -7859,6 +7986,125 @@ mod this_first_tests {
         }
         if let Some(g) = EXTS.lock().unwrap().as_mut() {
             g.remove(&vtbl);
+        }
+    }
+}
+
+#[cfg(test)]
+mod in_place_tests {
+    use super::*;
+
+    /// `patch_in_place` on a fake vtable: only the given entries are written (the next one – a
+    /// neighbouring table's – stays), `orig_fn` gives the entries from before for those and the
+    /// table's own past them, and a second patch of the same table writes nothing (its "originals"
+    /// would be XCL's own entries). No GPU.
+    #[test]
+    fn a_vtable_patched_in_place_keeps_its_originals_and_its_neighbour() {
+        const NEIGHBOUR: usize = 0x5e17_1e1;
+        let table: &'static mut [usize] = Box::leak(vec![0x10, 0x11, 0x12, 0x13, NEIGHBOUR, 0x15].into_boxed_slice());
+        let t = table.as_mut_ptr();
+        let obj = Box::into_raw(Box::new([t as usize])) as *mut c_void;
+        let registered = std::cell::Cell::new(0);
+        unsafe {
+            assert_eq!(in_place_original(t as usize, 0), None);
+            assert_eq!(patch_in_place(t, &[0x10, 0xA1, 0xA2, 0xA3], || registered.set(registered.get() + 1)), Ok(true));
+            assert_eq!(std::slice::from_raw_parts(t, 6), &[0x10, 0xA1, 0xA2, 0xA3, NEIGHBOUR, 0x15]);
+            assert_eq!((0..6).map(|s| orig_fn(obj, s)).collect::<Vec<_>>(), [0x10, 0x11, 0x12, 0x13, NEIGHBOUR, 0x15]);
+            assert_eq!(patch_in_place(t, &[0xB0, 0xB1], || registered.set(registered.get() + 1)), Ok(false));
+            assert_eq!(std::slice::from_raw_parts(t, 6), &[0x10, 0xA1, 0xA2, 0xA3, NEIGHBOUR, 0x15]);
+            assert_eq!(orig_fn(obj, 1), 0x11);
+            drop(Box::from_raw(obj as *mut [usize; 1]));
+        }
+        assert_eq!(registered.get(), 1, "registered once, before the first write");
+    }
+
+    /// Concurrent callers invoking methods through a read-only vtable while multiple threads race
+    /// to `patch_in_place` must never observe a torn entry, a missing `orig_fn`, or a second
+    /// patch, and `UnadoptGuard::new` must skip the in-place patched table.
+    #[test]
+    fn concurrent_calls_and_patches_on_readonly_vtable_never_tear_or_miss_orig_fn() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE};
+
+        unsafe extern "system" fn orig_slot(_this: *mut c_void) -> usize {
+            0x1111_0001
+        }
+        unsafe extern "system" fn hook_slot(this: *mut c_void) -> usize {
+            let f: unsafe extern "system" fn(*mut c_void) -> usize = std::mem::transmute(orig_fn(this, 1));
+            f(this) + 1
+        }
+
+        unsafe {
+            let mem = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut usize;
+            assert!(!mem.is_null());
+            for i in 0..8 {
+                mem.add(i).write(orig_slot as usize);
+            }
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(mem as *const c_void, 4096, PAGE_READONLY, &mut old), 0);
+
+            let obj_box = Box::leak(Box::new([mem as usize]));
+            let obj_addr = obj_box.as_mut_ptr() as usize;
+            let table_addr = mem as usize;
+
+            let barrier = Arc::new(Barrier::new(6));
+            let stop = Arc::new(AtomicBool::new(false));
+            let hook_hits = Arc::new(AtomicUsize::new(0));
+            let reg_count = Arc::new(AtomicUsize::new(0));
+
+            let mut callers = Vec::new();
+            for _ in 0..4 {
+                let b = barrier.clone();
+                let s = stop.clone();
+                let hits = hook_hits.clone();
+                callers.push(std::thread::spawn(move || {
+                    b.wait();
+                    let obj = obj_addr as *mut c_void;
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while std::time::Instant::now() < until {
+                        let vt = (*(obj as *const AtomicUsize)).load(Ordering::Acquire) as *const AtomicUsize;
+                        let fp = (*vt.add(1)).load(Ordering::Acquire);
+                        let f: unsafe extern "system" fn(*mut c_void) -> usize = std::mem::transmute(fp);
+                        let r = f(obj);
+                        assert!(r == 0x1111_0001 || r == 0x1111_0002, "unexpected slot result {r:#x}");
+                        if r == 0x1111_0002 {
+                            hits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if s.load(Ordering::Relaxed) && hits.load(Ordering::Relaxed) > 0 {
+                            break;
+                        }
+                    }
+                }));
+            }
+
+            let mut patchers = Vec::new();
+            for _ in 0..2 {
+                let b = barrier.clone();
+                let rc = reg_count.clone();
+                patchers.push(std::thread::spawn(move || {
+                    b.wait();
+                    let entries = [orig_slot as usize, hook_slot as usize, orig_slot as usize, orig_slot as usize];
+                    patch_in_place(table_addr as *mut usize, &entries, || {
+                        register_ext(table_addr);
+                        rc.fetch_add(1, Ordering::SeqCst);
+                    })
+                }));
+            }
+
+            let results: Vec<Result<bool, String>> = patchers.into_iter().map(|h| h.join().unwrap()).collect();
+            stop.store(true, Ordering::Relaxed);
+            for h in callers {
+                h.join().unwrap();
+            }
+
+            assert_eq!(results.iter().filter(|r| matches!(r, Ok(true))).count(), 1, "exactly one thread patches: {results:?}");
+            assert_eq!(results.iter().filter(|r| matches!(r, Ok(false))).count(), 1, "other racer sees Ok(false): {results:?}");
+            assert_eq!(reg_count.load(Ordering::SeqCst), 1, "register runs exactly once");
+            assert!(hook_hits.load(Ordering::Relaxed) > 0, "callers must observe the patched hook");
+            // `UnadoptGuard::new` returns early off Wine, so check the skip itself as well
+            assert!(skips_guard(table_addr), "UnadoptGuard must skip in-place patched vtables");
+            assert!(UnadoptGuard::new(obj_addr as *mut c_void).is_none(), "UnadoptGuard must skip in-place patched vtables");
         }
     }
 }
