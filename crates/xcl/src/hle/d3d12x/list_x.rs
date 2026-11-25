@@ -1284,7 +1284,15 @@ unsafe fn would_signal_close_cycle(graph: &mut SyncGraph, sig_q: usize, target_v
         if completed == u64::MAX || target.armed_waits.is_empty() {
             return false;
         }
-        target.armed_waits.iter().filter(|aw| aw.val <= sig_val).map(|aw| (aw.waiting_queue, aw.wait_seq)).collect()
+        // A wait an earlier signal of this cell already satisfies (GPU or CPU) does not wait on
+        // this one: counting it made every pipelined frame (wait N armed, signal N+1 next) a cycle.
+        let covered = target.submitted_max.max(target.cpu_signaled_max);
+        target
+            .armed_waits
+            .iter()
+            .filter(|aw| aw.val <= sig_val && aw.val > covered)
+            .map(|aw| (aw.waiting_queue, aw.wait_seq))
+            .collect()
     };
     if target_waiters.is_empty() {
         return false;
@@ -1525,13 +1533,11 @@ fn wait_expired(aw: &mut ArmedGpuWait, held: bool) -> bool {
 fn wake_sync_watchdog() {
     let pair = sync_watchdog_pair(&SYNC_WATCHDOG_WAKE, || {
         let _ = std::thread::Builder::new().name("xcl-sync-watchdog".into()).spawn(|| loop {
-            let (lock, cv) = SYNC_WATCHDOG_WAKE.get().unwrap();
-            let guard = lock.lock().unwrap();
-            if ARMED_GPU_WAITS.load(Ordering::Acquire) == 0 {
-                let _g = cv.wait(guard).unwrap();
+            let pair = SYNC_WATCHDOG_WAKE.get().unwrap();
+            let Some(guard) = sync_watchdog_sleep_if_idle(pair, &ARMED_GPU_WAITS, || {}) else {
                 continue;
-            }
-            let _ = cv.wait_timeout(guard, Duration::from_millis(50)).unwrap();
+            };
+            let _ = pair.1.wait_timeout(guard, Duration::from_millis(50)).unwrap();
             let (expired, rewinds) = {
                 let mut g = SYNC_GRAPH.lock().unwrap();
                 let mut out: Vec<(u64, u64, ID3D12Fence, usize, i32, Option<usize>, Option<i32>, u64, u64, u64)> = Vec::new();
@@ -1620,6 +1626,31 @@ fn wake_sync_watchdog() {
             }
         });
     });
+    notify_sync_watchdog(pair);
+}
+
+/// The watchdog's check for armed waits: none (`armed` is 0) – it sleeps until a
+/// `notify_sync_watchdog` and returns `None`; some – the pair's lock, still held. The lock is held
+/// from the check until `cv.wait` releases it; `after_check` runs in between (a test's pause).
+fn sync_watchdog_sleep_if_idle<'a>(
+    pair: &'a (Mutex<()>, Condvar),
+    armed: &AtomicUsize,
+    after_check: impl FnOnce(),
+) -> Option<std::sync::MutexGuard<'a, ()>> {
+    let guard = pair.0.lock().unwrap();
+    if armed.load(Ordering::Acquire) != 0 {
+        return Some(guard);
+    }
+    after_check();
+    let _g = pair.1.wait(guard).unwrap();
+    None
+}
+
+/// Wake the watchdog after a wait was armed. The notify takes the pair's lock: without it, it can
+/// fall between the watchdog's check (still 0) and its `cv.wait`, and the watchdog sleeps with the
+/// wait armed and never releases it (the lock is a leaf: the watchdog takes no other lock with it).
+fn notify_sync_watchdog(pair: &(Mutex<()>, Condvar)) {
+    let _g = pair.0.lock().unwrap();
     pair.1.notify_one();
 }
 
@@ -6299,6 +6330,43 @@ mod tests {
         assert_eq!(seen, [true]);
     }
 
+    /// A wait armed between the watchdog's check (no wait armed) and its `cv.wait` wakes it: the
+    /// watchdog pauses there (`after_check`) until the arm's notify is done, or 200 ms when the
+    /// notify waits for the lock. A notify that does not take the lock is lost there, and the
+    /// watchdog sleeps with the wait armed (no "did not complete" release).
+    #[test]
+    fn a_wait_armed_during_the_watchdogs_check_wakes_it() {
+        use std::sync::{mpsc, Arc};
+        let pair = Arc::new((Mutex::new(()), Condvar::new()));
+        let armed = Arc::new(AtomicUsize::new(0));
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (notified_tx, notified_rx) = mpsc::channel::<()>();
+        let (woke_tx, woke_rx) = mpsc::channel();
+        let (p, a) = (pair.clone(), armed.clone());
+        let watchdog = std::thread::spawn(move || {
+            let slept = sync_watchdog_sleep_if_idle(&p, &a, || {
+                checked_tx.send(()).unwrap();
+                let _ = notified_rx.recv_timeout(Duration::from_millis(200));
+            })
+            .is_none();
+            woke_tx.send(slept).unwrap();
+        });
+        checked_rx.recv().unwrap();
+        armed.fetch_add(1, Ordering::AcqRel);
+        notify_sync_watchdog(&pair);
+        // (the pause may be over already: then nobody receives this)
+        let _ = notified_tx.send(());
+        let woke = woke_rx.recv_timeout(Duration::from_secs(2));
+        if woke.is_err() {
+            // let the thread end before the test fails
+            pair.1.notify_one();
+        }
+        watchdog.join().unwrap();
+        assert_eq!(woke, Ok(true), "the watchdog slept through the arm's notify");
+        // a wait already armed: no sleep, the lock comes back
+        assert!(sync_watchdog_sleep_if_idle(&pair, &armed, || unreachable!()).is_some());
+    }
+
     /// Submitting a DIRECT list with `Wait64BitValueX(va, >=, 0x677)` BEFORE submitting the
     /// COMPUTE list that recorded `Write64BitValueBottomOfPipeX(va, 0x677)` must bridge via
     /// GPU `queue.Wait`/`queue.Signal` without blocking the submitter thread for `WAIT_TIMEOUT`.
@@ -6887,6 +6955,65 @@ mod tests {
             assert!(
                 !would_signal_close_cycle(&mut g3, 0xD001, 0x3000, 0x78d),
                 "pipelined 3-queue chain with wait_seq > sig_seq must NOT be treated as a cycle"
+            );
+
+            // 3. Next frame's signal on a cell whose armed wait an earlier signal already covers
+            //    (a retail title, frame 0x6dc): C (0xC001) signalled A=0x6db, Direct (0xD001)
+            //    waits A >= 0x6db (seq 3544) and later signals B=0x6dc (seq 3572); C waits on
+            //    B >= 0x6dc (seq 34) and now signals A=0x6dc. Direct's wait is satisfied by C's
+            //    0x6db signal, not by this one: no cycle.
+            let fa: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let fb: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut gp = SyncGraph::default();
+            gp.cells.insert(
+                0x4000,
+                SyncCell {
+                    fence: Some(fa),
+                    device: dev.as_raw() as usize,
+                    recorded_max: 0x6dc,
+                    submitted_max: 0x6db,
+                    submitted_queue: Some(0xC001),
+                    armed_waits: vec![ArmedGpuWait {
+                        val: 0x6db,
+                        waiting_queue: 0xD001,
+                        waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+                        wait_seq: 3544,
+                        armed_at: Instant::now(),
+                        after_write64: false,
+                    }],
+                    submitted_signals: vec![SubmittedSignal { val: 0x6db, queue: 0xC001, seq: 16 }],
+                    ..Default::default()
+                },
+            );
+            gp.cells.insert(
+                0x5000,
+                SyncCell {
+                    fence: Some(fb),
+                    device: dev.as_raw() as usize,
+                    recorded_max: 0x6dc,
+                    submitted_max: 0x6dc,
+                    submitted_queue: Some(0xD001),
+                    armed_waits: vec![ArmedGpuWait {
+                        val: 0x6dc,
+                        waiting_queue: 0xC001,
+                        waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_COMPUTE.0,
+                        wait_seq: 34,
+                        armed_at: Instant::now(),
+                        after_write64: false,
+                    }],
+                    submitted_signals: vec![SubmittedSignal { val: 0x6dc, queue: 0xD001, seq: 3572 }],
+                    ..Default::default()
+                },
+            );
+            assert!(
+                !would_signal_close_cycle(&mut gp, 0xC001, 0x4000, 0x6dc),
+                "a wait an earlier signal already satisfies must NOT make the next frame's signal a cycle"
+            );
+            // Direct waiting on A >= 0x6dc instead (only this signal satisfies it): a true cycle.
+            gp.cells.get_mut(&0x4000).unwrap().armed_waits[0].val = 0x6dc;
+            assert!(
+                would_signal_close_cycle(&mut gp, 0xC001, 0x4000, 0x6dc),
+                "a wait only this signal satisfies, armed before the waiter's own signal, MUST be a cycle"
             );
         }
     }
