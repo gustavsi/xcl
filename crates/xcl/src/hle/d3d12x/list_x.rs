@@ -2590,6 +2590,24 @@ pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64
     write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, W);
 }
 
+/// Create a new adopted PC command list matching `template`'s device and type, closed and ready
+/// for `Reset`. Releases and forgets the list instead of pooling it if `Close` fails.
+unsafe fn create_closed_spare(template: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE, alloc: usize) -> Option<*mut c_void> {
+    let pc_alloc = super::alloc_pool::current(alloc);
+    let made = real::create_raw_pc_command_list(device_of(template)?.as_raw(), ty, pc_alloc, 0)?;
+    let ext = *(made as *const usize);
+    let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(made, PC_CLOSE)(made);
+    real::preserve_vtable(made, ext);
+    if hr < 0 {
+        super::bind::forget(made);
+        let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(made as *const *const usize)).add(2));
+        rel(made);
+        return None;
+    }
+    on_create(made, pc_alloc, 0, ty);
+    Some(made)
+}
+
 /// The title Resets its list (`title_list` `wrapper`) while the GPU has not finished the last
 /// submit of the PC list `primary` behind it: a console lets the title submit the new recording
 /// at once, the PC does not let `primary` be submitted again yet (#1452, debug layer id 553;
@@ -2602,20 +2620,7 @@ pub(super) unsafe fn reset_stand_in(wrapper: *mut c_void, primary: *mut c_void, 
     }
     let spare = match super::title_list::pop_spare(wrapper) {
         Some(p) => p,
-        None => {
-            let pc_alloc = super::alloc_pool::current(alloc);
-            let made = real::create_raw_pc_command_list(device_of(primary)?.as_raw(), ty, pc_alloc, 0)?;
-            on_create(made, pc_alloc, 0, ty);
-            // (closed: it is reset below like a spare)
-            let ext = *(made as *const usize);
-            let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(made, PC_CLOSE)(made);
-            real::preserve_vtable(made, ext);
-            if hr < 0 {
-                super::title_list::put_spare(wrapper, made);
-                return None;
-            }
-            made
-        }
+        None => create_closed_spare(primary, ty, alloc)?,
     };
     if reset_pc(spare, alloc, pso) < 0 {
         super::title_list::put_spare(wrapper, spare);
@@ -3275,7 +3280,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return;
     }
     let dev_raw = device_of(this).map_or(0, |d| d.as_raw() as usize);
-    let (alloc, queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, waits, sparse_writes) = {
+    let (alloc, queue, last_queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, waits, sparse_writes) = {
         let mut g = LISTS.lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else {
             if once(&NO_QUEUE, 4) {
@@ -3308,7 +3313,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         let cpu_writes = std::mem::take(&mut s.cpu_writes);
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, write64_signals, cpu_writes))
+        (s.allocator, q, s.last_queue, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, write64_signals, cpu_writes))
     };
     let (sparse_writes, write64_signals, cpu_writes) = sparse_writes;
 
@@ -3337,8 +3342,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
 
-    // If this list was previously split mid-recording around a `Wait64`, flush all earlier closed
-    // segments in exact order before submitting `this`, then resume recording on `primary`.
+    // Capture wrapper before `reclaim_for_kickoff` updates `WRAPPER_OF`. If this list was split
+    // mid-recording around a `Wait64`, flush earlier closed segments in order before `this`.
+    let wrapper = super::title_list::wrapper_of(this);
     let kickoff_split = super::title_list::reclaim_for_kickoff(this);
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
@@ -3382,7 +3388,57 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
     super::cpu_writes::after(q_raw, cpu_writes);
 
-    let target = if let Some((primary, _, reclaimed)) = kickoff_split {
+    let (current_target, prior_retired, reclaimed) = match kickoff_split {
+        Some((primary, prior, reclaimed)) => (primary, prior, reclaimed),
+        None => (this, Vec::new(), Vec::new()),
+    };
+    let init_pso = if ty == D3D12_COMMAND_LIST_TYPE_COPY { 0 } else { super::pso_async::resolve_for_bind(bound_pso) };
+    let reset_one = |pc_list: *mut c_void| -> i32 {
+        let ext_closed = *(pc_list as *const usize);
+        let hr = super::alloc_pool::reset_list(pc_list as usize, alloc, list_type(pc_list).0, |pc_alloc| {
+            let _alloc_guard = real::UnadoptGuard::new(pc_alloc as *mut c_void);
+            let _pso_guard = real::UnadoptGuard::new(init_pso as *mut c_void);
+            pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(pc_list, PC_RESET)(pc_list, pc_alloc, init_pso)
+        });
+        real::preserve_vtable(pc_list, ext_closed);
+        hr
+    };
+    // Avoid resuming on a PC command list whose submit is still in flight on the GPU (#1452,
+    // debug layer id 553): pick `primary` once idle, else an idle spare, else a fresh closed spare.
+    let (target, reset_hr) = if let Some(w) = wrapper {
+        let primary = super::title_list::primary_of(w);
+        let candidate = if current_target != primary && !super::alloc_pool::in_flight(primary as usize) {
+            Some(primary)
+        } else if super::alloc_pool::in_flight(current_target as usize) {
+            super::title_list::pop_spare(w).or_else(|| create_closed_spare(current_target, ty, alloc))
+        } else {
+            None
+        };
+        if let Some(cand) = candidate.filter(|&c| c != current_target) {
+            let hr = reset_one(cand);
+            if hr >= 0 {
+                super::title_list::switch_active_for_kickoff(w, current_target, cand);
+                (cand, hr)
+            } else {
+                if cand != primary {
+                    super::title_list::put_spare(w, cand);
+                }
+                (current_target, reset_one(current_target))
+            }
+        } else {
+            (current_target, reset_one(current_target))
+        }
+    } else {
+        (current_target, reset_one(current_target))
+    };
+    if reset_hr < 0 {
+        return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
+    }
+    super::dred::reset(target);
+    if init_pso != 0 {
+        super::dred::mark_pipeline(target, bound_pso, init_pso);
+    }
+    if target != this {
         let (ended_early, pred_buf_obj, bindings_copy) = {
             let mut g = LISTS.lock().unwrap();
             if let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) {
@@ -3391,43 +3447,32 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
                 (Vec::new(), None, Bindings::default())
             }
         };
-        super::bind::inherit_for_split(this, primary, alloc);
-        for seg in reclaimed {
-            super::bind::reset(seg as *mut c_void, 0, 0);
-            clear_segment_state(seg);
+        super::bind::inherit_for_split(this, target, alloc);
+        for seg in reclaimed.into_iter().chain(prior_retired.into_iter().map(|p| p as usize)).chain([this as usize]) {
+            if seg != target as usize {
+                super::bind::reset(seg as *mut c_void, 0, 0);
+                clear_segment_state(seg);
+            }
         }
-        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(primary as usize))) {
-            s.allocator = alloc;
-            s.bound_pso = bound_pso;
-            s.depth_bias = depth_bias;
-            s.index_buffer = index_buffer;
-            s.depth_bounds = depth_bounds;
-            s.predication = predication;
-            s.pred_buf = pred_buf_obj;
-            s.pred_in_state = false;
-            s.occlusion = Occlusion { active: None, ended_early };
-            s.written_ranges.clear();
-            s.clear_sparse_writes();
-            s.clear_write64_signals();
-            s.clear_waits();
-            s.cpu_writes.clear();
-            s.bindings = bindings_copy;
-        }
-        primary
-    } else {
-        this
-    };
-
-    let ext_closed = *(target as *const usize);
-    let init_pso = super::pso_async::resolve_for_bind(bound_pso);
-    let reset_hr = super::alloc_pool::reset_list(target as usize, alloc, list_type(target).0, |pc_alloc| {
-        let _alloc_guard = real::UnadoptGuard::new(pc_alloc as *mut c_void);
-        let _pso_guard = real::UnadoptGuard::new(init_pso as *mut c_void);
-        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso)
-    });
-    real::preserve_vtable(target, ext_closed);
-    if reset_hr < 0 {
-        return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
+        let mut g = LISTS.lock().unwrap();
+        let s = g.get_or_insert_with(HashMap::new).entry(target as usize).or_default();
+        s.allocator = alloc;
+        s.list_type = Some(ty);
+        s.last_queue = last_queue.or(Some(queue));
+        s.bound_pso = bound_pso;
+        s.depth_bias = depth_bias;
+        s.index_buffer = index_buffer;
+        s.depth_bounds = depth_bounds;
+        s.predication = predication;
+        s.pred_buf = pred_buf_obj;
+        s.pred_in_state = false;
+        s.occlusion = Occlusion { active: None, ended_early };
+        s.written_ranges.clear();
+        s.clear_sparse_writes();
+        s.clear_write64_signals();
+        s.clear_waits();
+        s.cpu_writes.clear();
+        s.bindings = bindings_copy;
     }
     reset_copy_scratch(target);
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
@@ -3477,11 +3522,13 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             pc::<unsafe extern "system" fn(*mut c_void, f32, f32)>(target, PC_OM_SET_DEPTH_BOUNDS)(target, min, max);
         }
     }
-    if let (Some(op), Some(pb)) = (predication, pred_buf) {
-        transition(target, pb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
-        pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(target, PC_SET_PREDICATION)(target, pb, 0, op);
-        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
-            s.pred_in_state = true;
+    if ty != D3D12_COMMAND_LIST_TYPE_COPY {
+        if let (Some(op), Some(pb)) = (predication, pred_buf) {
+            transition(target, pb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
+            pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(target, PC_SET_PREDICATION)(target, pb, 0, op);
+            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
+                s.pred_in_state = true;
+            }
         }
     }
 }
@@ -3917,6 +3964,7 @@ pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
+    super::bind::set_heaps(this, if heaps.is_null() { &[] } else { std::slice::from_raw_parts(heaps, n as usize) });
     if heaps.is_null() || n == 0 {
         // no heaps: nothing bound any more (`ensure_view_heap` binds the shared heaps again
         // before a translated draw or dispatch reads memory windows or samplers from them)
@@ -7464,6 +7512,157 @@ mod tests {
             console_heap::unregister(co);
             console_heap::unregister(go);
             assert!(got.iter().all(|&v| v == 0xDEAD_BEEF), "the UAV was not cleared: {:x?}", &got[..4]);
+        }
+    }
+
+    fn test_device_or_warp() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        if let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) {
+            return Some(dev);
+        }
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+            let warp: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).ok()?;
+            dev
+        }
+    }
+
+    unsafe fn kickoff_test_setup(dev: &ID3D12Device) -> (ID3D12CommandQueue, ID3D12CommandAllocator, *mut c_void, *mut c_void, ID3D12Fence, ID3D12Fence) {
+        let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+        let q_raw = q.as_raw();
+        real::adopt(q_raw, real::Kind::CommandQueue);
+        on_queue_create(q_raw as usize, dev.as_raw() as usize, ty);
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+        let a = alloc.as_raw() as usize;
+        let primary = dev.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(0, ty, &alloc, None).unwrap().into_raw();
+        real::adopt(primary, real::Kind::CommandList);
+        on_create(primary, a, 0, ty);
+        super::super::bind::reset(primary, a, 0);
+        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(primary as usize))) {
+            s.last_queue = Some(q_raw as usize);
+        }
+        let w = super::super::title_list::wrap(primary);
+        let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        (q, alloc, primary, w, gate, done)
+    }
+
+    static KICKOFF_GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Back-to-back `KickoffX` and final `ExecuteCommandLists` while the queue is gated on an
+    /// unsignalled fence must switch to idle spare PC lists (`note_resubmits == 0`), preserve
+    /// bindings across each kickoff, and return to `primary` once the GPU finishes (#1452).
+    #[test]
+    fn kickoff_x_while_in_flight_switches_to_idle_spare_and_preserves_state() {
+        let _guard = KICKOFF_GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dev) = test_device_or_warp() else { return crate::gpu::recomp::runner::skip_test("no GPU or WARP"); };
+        unsafe {
+            let (q, _alloc, primary, w, gate, done) = kickoff_test_setup(&dev);
+            let q_raw = q.as_raw();
+            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(primary as usize))) {
+                (s.bindings.stencil, s.bindings.topology) = (Some(0x5A), Some(4));
+            }
+            let close: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(w as *const *const usize)).add(9));
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(w as *const *const usize)).add(2));
+            let exec: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
+                std::mem::transmute(real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
+            let segs = || { let mut v = Vec::new(); assert!(super::super::title_list::push_segments(w, &mut v)); v };
+
+            q.Wait(&gate, 1).unwrap();
+            assert_eq!(segs(), vec![primary]);
+            // KickoffX #1 & #2 while gated: must switch primary -> s1 -> s2 with 0 resubmits and keep bindings.
+            kickoff_x(primary);
+            let s1 = segs();
+            assert_eq!(s1.len(), 1);
+            let resub1 = super::super::alloc_pool::note_resubmits(q_raw, &s1);
+            let state1 = {
+                let g = LISTS.lock().unwrap();
+                let s = g.as_ref().unwrap().get(&(s1[0] as usize)).unwrap();
+                (s.bindings.stencil, s.bindings.topology, s.last_queue)
+            };
+            kickoff_x(s1[0]);
+            let s2 = segs();
+            assert_eq!(s2.len(), 1);
+            let resub2 = super::super::alloc_pool::note_resubmits(q_raw, &s2);
+            let state2 = {
+                let g = LISTS.lock().unwrap();
+                let s = g.as_ref().unwrap().get(&(s2[0] as usize)).unwrap();
+                (s.bindings.stencil, s.bindings.topology)
+            };
+            // Unblock GPU so primary & s1 drain; KickoffX #3 on s2 must switch directly back to primary.
+            gate.Signal(1).unwrap();
+            q.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 5000).expect("queue drains");
+            kickoff_x(s2[0]);
+            let after_drain = segs();
+            assert_eq!(close(w), 0);
+            let resub3 = super::super::alloc_pool::note_resubmits(q_raw, &after_drain);
+            exec(q_raw, after_drain.len() as u32, after_drain.as_ptr());
+            super::super::alloc_pool::executed(q_raw, &after_drain);
+            q.Signal(&done, 2).unwrap();
+            crate::gpu::fence::wait(&done, 2, &dev, None, 5000).expect("queue drains 2");
+            let removed = dev.GetDeviceRemovedReason();
+            assert_eq!(release(w), 0);
+            drop(q);
+
+            assert_ne!(s1[0], primary, "KickoffX #1 must not keep recording on in-flight primary");
+            assert_eq!((resub1, state1), (0, (Some(0x5A), Some(4), Some(q_raw as usize))));
+            assert!(s2[0] != primary && s2[0] != s1[0], "KickoffX #2 must use a third distinct PC list");
+            assert_eq!((resub2, state2), (0, (Some(0x5A), Some(4))));
+            assert_eq!((after_drain, resub3), (vec![primary], 0));
+            assert!(removed.is_ok());
+        }
+    }
+
+    /// `KickoffX` on a list split around a mid-list `Write64 -> Wait64` submits both `primary`
+    /// and the split segment; while in flight it must resume on an idle spare (`note_resubmits == 0`).
+    #[test]
+    fn kickoff_x_after_midlist_split_switches_to_idle_spare() {
+        let _guard = KICKOFF_GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dev) = test_device_or_warp() else { return crate::gpu::recomp::runner::skip_test("no GPU or WARP"); };
+        unsafe {
+            let (q, _alloc, primary, w, gate, done) = kickoff_test_setup(&dev);
+            let q_raw = q.as_raw();
+            let close: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(w as *const *const usize)).add(9));
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(w as *const *const usize)).add(2));
+            let exec: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
+                std::mem::transmute(real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
+
+            let cell = Box::new(AtomicU64::new(0));
+            let va = &*cell as *const AtomicU64 as u64;
+            note_write64_recorded(primary, va, 1);
+            wait64_x(primary, va, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 1, 0, 0);
+            let mut split_segs = Vec::new();
+            assert!(super::super::title_list::push_segments(w, &mut split_segs));
+            assert_eq!(split_segs.len(), 2);
+            let seg1 = split_segs[1];
+            assert!(split_segs[0] == primary && seg1 != primary);
+
+            q.Wait(&gate, 1).unwrap();
+            kickoff_x(seg1);
+            let mut after = Vec::new();
+            assert!(super::super::title_list::push_segments(w, &mut after));
+            assert_eq!((after.len(), close(w)), (1, 0));
+            let resub = super::super::alloc_pool::note_resubmits(q_raw, &after);
+            exec(q_raw, after.len() as u32, after.as_ptr());
+            super::super::alloc_pool::executed(q_raw, &after);
+
+            gate.Signal(1).unwrap();
+            q.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 5000).expect("split kickoff drains");
+            let removed = dev.GetDeviceRemovedReason();
+            assert_eq!(release(w), 0);
+            drop(q);
+            if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
+                gr.cells.remove(&va);
+            }
+            assert!(after[0] != primary && after[0] != seg1, "split KickoffX must resume on an idle spare");
+            assert_eq!(resub, 0);
+            assert!(removed.is_ok());
         }
     }
 }
