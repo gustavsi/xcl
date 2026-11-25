@@ -926,6 +926,10 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
     if is_ext(v) {
         return;
     }
+    // Read the setting `res_release` needs here, on the thread adopting the object: D3DMetal
+    // releases the resources of an executed list on a thread of its own, which has no Wine TEB,
+    // and reading the environment there for the first time never returns.
+    super::late_release::init();
     let ext = class_for(obj, v, kind);
     *(obj as *mut usize) = ext;
 }
@@ -1337,7 +1341,8 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
     let flags = if shared { d[2] & !(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32) } else { d[2] };
     let pc = [d[0], pc_n, flags, d[3]];
     let hr = dev_create_descriptor_heap(this, pc.as_ptr() as usize, riid, ppv);
-    if hr >= 0 {
+    // a null `ppv` is D3D12's validation call: S_FALSE and no heap to register
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         let raw = *ppv;
         let heap = ID3D12DescriptorHeap::from_raw_borrowed(&raw).unwrap();
         let dev = ID3D12Device::from_raw_borrowed(&this).unwrap();
@@ -1902,8 +1907,20 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
     f(this, sub, range)
 }
 
-unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
+/// The Release override for adopted resources.  Public so `late_release::drain_deferred`
+/// can run the final Release of a deferred resource through the normal path.
+pub(super) unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+
+    // A thread the host driver created (D3DMetal on macOS) must not take locks or call
+    // Win32 here.  Its Release is deferred to a Wine thread.
+    if super::late_release::is_foreign_thread() {
+        return foreign_release(this, f);
+    }
+
+    // On a normal (Wine) thread, drain any releases a foreign thread deferred.
+    super::late_release::drain_deferred();
+
     // The last reference: kept until the queues are past the work in flight (`late_release`).
     // (Two last-but-one releases at once can miss each other here; the object then goes at
     // once, as before.)
@@ -1922,32 +1939,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         f(this)
     };
     if n == 0 {
-        if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
-            s.remove(&(this as usize));
-        }
-        if let Some(s) = SPARSE_READBACK.lock().unwrap().as_mut() {
-            s.remove(&(this as usize));
-        }
-        if let Some(s) = RESERVED.lock().unwrap().as_mut() {
-            s.remove(&(this as usize));
-        }
-        if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
-            m.remove(&(this as usize));
-        }
-        if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
-            m.remove(&(this as usize));
-        }
-        super::sparse::forget_buffer(this as usize);
-        super::vram::forget(this as usize);
-        super::title_textures::forget(this as usize);
-        let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
-        if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
-            if u.is_sparse(p) {
-                super::sparse::free(p);
-            } else {
-                u.free(p);
-            }
-        }
+        release_cleanup(this as usize);
     }
     if held {
         super::late_release::hold(this as usize);
@@ -1959,6 +1951,56 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
 pub(super) fn standin_released(pso: usize) {
     forget_pso(pso);
     super::pso_async::release(super::pso_async::released(pso));
+}
+
+/// Release on a thread XCL did not create.  The caller's Release never runs here: it goes to
+/// a Wine thread through the ring buffer, which runs it through `res_release`.  Deciding here
+/// whether it is the last one (AddRef returning 2) would not be safe: a Release on another
+/// thread between that check and ours can still take the count to 0 on this thread.
+///
+/// The returned count is what the caller's Release would leave if nothing else changed.  The
+/// AddRef and its Release cannot take the count to 0: the caller's reference is still held.
+unsafe fn foreign_release(this: *mut c_void, f: unsafe extern "system" fn(*mut c_void) -> u32) -> u32 {
+    let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+    let after_add = add(this);
+    f(this);
+    if !super::late_release::defer_release(this as usize) {
+        // Ring full: keep the reference (the object leaks, but no hang or corruption).
+        use std::sync::atomic::Ordering;
+        super::late_release::DEFERRED_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+    }
+    after_add.saturating_sub(2)
+}
+
+/// Remove a released resource from XCL's tracking maps.  Runs on a Wine thread only
+/// (from `res_release` or from `late_release::drain_deferred`).
+pub(super) unsafe fn release_cleanup(res: usize) {
+    if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
+        s.remove(&res);
+    }
+    if let Some(s) = SPARSE_READBACK.lock().unwrap().as_mut() {
+        s.remove(&res);
+    }
+    if let Some(s) = RESERVED.lock().unwrap().as_mut() {
+        s.remove(&res);
+    }
+    if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
+        m.remove(&res);
+    }
+    if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
+        m.remove(&res);
+    }
+    super::sparse::forget_buffer(res);
+    super::vram::forget(res);
+    super::title_textures::forget(res);
+    let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&res));
+    if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
+        if u.is_sparse(p) {
+            super::sparse::free(p);
+        } else {
+            u.free(p);
+        }
+    }
 }
 
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.

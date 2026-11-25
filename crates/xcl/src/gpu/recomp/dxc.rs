@@ -204,6 +204,22 @@ mod version_tests {
     use super::*;
 
     #[test]
+    fn a_folder_whose_dxcompiler_does_not_load_leaves_its_dxil_unloaded() {
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        let Some(real) = candidates().into_iter().map(|d| d.join("dxil.dll")).find(|p| p.is_file()) else {
+            return crate::gpu::recomp::runner::skip_test("no DXC");
+        };
+        let dir = std::env::temp_dir().join(format!("xcl-dxc-candidate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(&real, dir.join("dxil.dll")).unwrap();
+        std::fs::write(dir.join("dxcompiler.dll"), b"not a library").unwrap();
+        assert_eq!(unsafe { load_candidate(&dir) }, None);
+        let left = unsafe { GetModuleHandleW(crate::util::wide(&dir.join("dxil.dll").to_string_lossy()).as_ptr()) };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(left.is_null(), "the failed folder's dxil.dll is still loaded");
+    }
+
+    #[test]
     fn versions_parse_and_compare_as_numbers() {
         assert_eq!(parse_version("10.0.26100.0"), Some([10, 0, 26100, 0]));
         assert_eq!(parse_version("1.9.2602.17"), Some([1, 9, 2602, 17]));
@@ -310,39 +326,51 @@ pub fn location() -> Result<&'static Path, String> {
 
 fn load() -> Result<&'static (PathBuf, usize), String> {
     LIB.get_or_init(|| {
-        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
         for dir in candidates() {
-            let dxc = dir.join("dxcompiler.dll");
-            if !dxc.is_file() {
-                continue;
-            }
-            unsafe {
-                let dxil = dir.join("dxil.dll");
-                let signer = if dxil.is_file() { LoadLibraryW(crate::util::wide(&dxil.to_string_lossy()).as_ptr()) } else { std::ptr::null_mut() };
-                let h = LoadLibraryW(crate::util::wide(&dxc.to_string_lossy()).as_ptr());
-                if h.is_null() {
-                    continue;
-                }
-                if let Some(f) = GetProcAddress(h, b"DxcCreateInstance\0".as_ptr()) {
-                    let mut t = Toolchain { dir: dir.display().to_string(), ..Default::default() };
-                    t.dxcompiler = library(std::mem::transmute::<usize, CreateInstance>(f as usize), &CLSID_DxcCompiler, &dxc);
-                    if let Some(g) = if signer.is_null() { None } else { GetProcAddress(signer, b"DxcCreateInstance\0".as_ptr()) } {
-                        t.dxil = library(std::mem::transmute::<usize, CreateInstance>(g as usize), &windows::Win32::Graphics::Direct3D::Dxc::CLSID_DxcValidator, &dxil);
-                    }
-                    let signer = if signer.is_null() { "no dxil.dll".to_string() } else { format!("dxil {}", t.dxil) };
-                    crate::xlog_info!("DXC: dxcompiler {}, {signer}, from {}", t.dxcompiler, t.dir);
-                    if t.outdated() {
-                        crate::xlog_warn!("DXC {} is older than {}.{}: {OUTDATED_COST}; {OUTDATED_FIX}", t.dxcompiler, RECOMMENDED.0, RECOMMENDED.1);
-                    }
-                    let _ = TOOLCHAIN.set(t);
-                    return Ok((dir, f as usize));
-                }
+            if let Some(f) = unsafe { load_candidate(&dir) } {
+                return Ok((dir, f));
             }
         }
         Err("dxcompiler.dll not found (set XCL_DXC_DIR or install the Windows SDK)".into())
     })
     .as_ref()
     .map_err(|e| e.clone())
+}
+
+/// `dir`'s DxcCreateInstance (its toolchain recorded), or None. A folder that does not give one
+/// leaves nothing of it loaded: a dxil.dll kept from it would be the one a later folder's
+/// dxcompiler.dll gets when it loads dxil.dll by name.
+unsafe fn load_candidate(dir: &Path) -> Option<usize> {
+    use windows_sys::Win32::Foundation::FreeLibrary;
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    let dxc = dir.join("dxcompiler.dll");
+    if !dxc.is_file() {
+        return None;
+    }
+    let dxil = dir.join("dxil.dll");
+    let signer = if dxil.is_file() { LoadLibraryW(crate::util::wide(&dxil.to_string_lossy()).as_ptr()) } else { std::ptr::null_mut() };
+    let h = LoadLibraryW(crate::util::wide(&dxc.to_string_lossy()).as_ptr());
+    let Some(f) = (if h.is_null() { None } else { GetProcAddress(h, b"DxcCreateInstance\0".as_ptr()) }) else {
+        if !h.is_null() {
+            FreeLibrary(h);
+        }
+        if !signer.is_null() {
+            FreeLibrary(signer);
+        }
+        return None;
+    };
+    let mut t = Toolchain { dir: dir.display().to_string(), ..Default::default() };
+    t.dxcompiler = library(std::mem::transmute::<usize, CreateInstance>(f as usize), &CLSID_DxcCompiler, &dxc);
+    if let Some(g) = if signer.is_null() { None } else { GetProcAddress(signer, b"DxcCreateInstance\0".as_ptr()) } {
+        t.dxil = library(std::mem::transmute::<usize, CreateInstance>(g as usize), &windows::Win32::Graphics::Direct3D::Dxc::CLSID_DxcValidator, &dxil);
+    }
+    let signer = if signer.is_null() { "no dxil.dll".to_string() } else { format!("dxil {}", t.dxil) };
+    crate::xlog_info!("DXC: dxcompiler {}, {signer}, from {}", t.dxcompiler, t.dir);
+    if t.outdated() {
+        crate::xlog_warn!("DXC {} is older than {}.{}: {OUTDATED_COST}; {OUTDATED_FIX}", t.dxcompiler, RECOMMENDED.0, RECOMMENDED.1);
+    }
+    let _ = TOOLCHAIN.set(t);
+    Some(f as usize)
 }
 
 /// The PC compiler's DxcCreateInstance (for titles that use the console's `dxcompiler_xs.dll`).
@@ -532,12 +560,50 @@ impl<J> Queue<J> {
 /// to be 6, which left most of a 16-thread CPU idle while a title with ~24 000 shaders
 /// compiled for half an hour. (Normal priority: a title thread can wait for a pipeline –
 /// `resolve_wait`, a compute pipeline's first bind – and must not wait behind its own threads.)
+/// Under Wine at most `WINE_COMPILE_THREADS` unless `XCL_DXC_THREADS` says otherwise.
 pub fn compile_threads() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        std::env::var("XCL_DXC_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores.saturating_sub(1)).clamp(1, 64)
+        let chosen = std::env::var("XCL_DXC_THREADS").ok().and_then(|v| v.parse().ok());
+        let wine = crate::util::under_wine();
+        let n = chosen.unwrap_or_else(|| default_compile_threads(cores, wine)).clamp(1, 64);
+        if wine && chosen.is_none() && n < cores.saturating_sub(1) {
+            crate::xlog_info!("DXC: {n} compile threads under Wine (XCL_DXC_THREADS to choose)");
+        }
+        n
     })
+}
+
+/// DXC threads under Wine when `XCL_DXC_THREADS` is unset. Under Wine the DXC workers of one
+/// process mostly wait on each other: on a 32-thread Ryzen with Wine 11.22, `--precompile
+/// --only cs` wrote 11.8 MB of DXIL in 120 s with 1 thread, 19.5 MB with 2 and 4, 17.8 MB with
+/// 8 and 12.8 MB with 16. With every core but one, a retail title's world load waited
+/// 35–70 s for each compute program it needed (#1269). Several processes do scale.
+const WINE_COMPILE_THREADS: usize = 4;
+
+/// `compile_threads` without `XCL_DXC_THREADS`: every core but one, at most
+/// `WINE_COMPILE_THREADS` under Wine (`wine`).
+fn default_compile_threads(cores: usize, wine: bool) -> usize {
+    let all = cores.saturating_sub(1);
+    if wine {
+        all.min(WINE_COMPILE_THREADS)
+    } else {
+        all
+    }
+}
+
+#[cfg(test)]
+mod thread_tests {
+    use super::default_compile_threads;
+
+    #[test]
+    fn wine_caps_the_default_compile_threads() {
+        assert_eq!(default_compile_threads(32, false), 31, "every core but one");
+        assert_eq!(default_compile_threads(32, true), 4, "under Wine at most 4");
+        assert_eq!(default_compile_threads(4, true), 3, "fewer cores than the cap: every core but one");
+        assert_eq!(default_compile_threads(1, true), 0, "clamped to 1 by compile_threads");
+    }
 }
 
 /// GB of commit `wait_for_memory` keeps free besides the compiles: 6 for a running title (its
