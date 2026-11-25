@@ -270,6 +270,19 @@ unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resourc
 
 /// Called with the original six ABI views bound. The extended signature is
 /// common to every piece and the whole fallback. Choose before recording any
+fn resolve_allocator(list: usize, allocator: usize) -> usize {
+    if super::super::alloc_pool::enabled() {
+        super::super::alloc_pool::recording_backing(list).unwrap_or(allocator)
+    } else {
+        allocator
+    }
+}
+
+#[cfg(test)]
+pub(in crate::hle::d3d12x) fn resolve_allocator_for_test(list: usize, allocator: usize) -> usize {
+    resolve_allocator(list, allocator)
+}
+
 /// part of the dispatch, including when scratch allocation fails.
 pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize, grid: [u32; 3]) -> Result<(), String> {
     let [x, y, z] = grid;
@@ -278,9 +291,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     if grid.contains(&0) { return Ok(()); }
     // A title Reset can switch to a different PC allocator while this
     // recording is still submitted on the old one. Retain by backing.
-    let allocator = if super::super::alloc_pool::enabled() {
-        super::super::alloc_pool::recording_backing(list.as_raw() as usize).unwrap_or(0)
-    } else { allocator };
+    let allocator = resolve_allocator(list.as_raw() as usize, allocator);
     let group = u64::from(chain.words) * 4;
     let needed = grid.into_iter().fold(group, |s, n| s.saturating_mul(n as u64));
     WANTED.fetch_max(needed, Ordering::Relaxed);

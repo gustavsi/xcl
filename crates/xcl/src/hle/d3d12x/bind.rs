@@ -459,7 +459,7 @@ unsafe fn chained_indirect(this: *mut c_void, list: &ID3D12GraphicsCommandList, 
     let seen: Vec<[u32; 3]> = (0..n.min(64)).filter_map(|k| read(args, args_title + u64::from(k * stride), 3)).map(|v| [v[0], v[1], v[2]]).collect();
     let predicated = super::list_x::predication_active(this);
     super::real::dispatch_chain::execute_indirect(list, pso, with(this, |s| s.allocator), args_va, stride, max, count_va, &seen,
-        predicated, || bind_abi(this, list, pso, false), ei)
+        predicated, || bind_abi(this, list, pso, false, 0).map(|_| ()), ei)
 }
 
 /// The GPU address of a title's buffer `res` at its offset `title` (a buffer in unified memory) or
@@ -1400,7 +1400,9 @@ void main(uint t : SV_GroupIndex) {
             };
             let run = |list: &ID3D12GraphicsCommandList, close: &dyn Fn()| {
                 close();
+                let _list_guard = real::UnadoptGuard::new(list.as_raw());
                 queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                drop(_list_guard);
                 let v = done.GetCompletedValue() + 1;
                 queue.Signal(&done, v).unwrap();
                 fence::wait(&done, v, &dev, None, 10_000).unwrap();

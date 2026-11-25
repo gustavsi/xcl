@@ -324,6 +324,8 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
+                quarantined: VecDeque::new(),
+                queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
                 staging: None,

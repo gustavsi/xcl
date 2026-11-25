@@ -7819,7 +7819,10 @@ mod tests {
             let after_drain = segs();
             assert_eq!(close(w), 0);
             let resub3 = super::super::alloc_pool::note_resubmits(q_raw, &after_drain);
-            exec(q_raw, after_drain.len() as u32, after_drain.as_ptr());
+            {
+                let _list_guards: Vec<_> = after_drain.iter().filter_map(|&l| real::UnadoptGuard::new(l)).collect();
+                exec(q_raw, after_drain.len() as u32, after_drain.as_ptr());
+            }
             super::super::alloc_pool::executed(q_raw, &after_drain);
             q.Signal(&done, 2).unwrap();
             crate::gpu::fence::wait(&done, 2, &dev, None, 5000).expect("queue drains 2");
@@ -7866,7 +7869,10 @@ mod tests {
             assert!(super::super::title_list::push_segments(w, &mut after));
             assert_eq!((after.len(), close(w)), (1, 0));
             let resub = super::super::alloc_pool::note_resubmits(q_raw, &after);
-            exec(q_raw, after.len() as u32, after.as_ptr());
+            {
+                let _list_guards: Vec<_> = after.iter().filter_map(|&l| real::UnadoptGuard::new(l)).collect();
+                exec(q_raw, after.len() as u32, after.as_ptr());
+            }
             super::super::alloc_pool::executed(q_raw, &after);
 
             gate.Signal(1).unwrap();
