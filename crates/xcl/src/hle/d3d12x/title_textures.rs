@@ -1282,7 +1282,8 @@ unsafe fn refresh_once(queue: *mut c_void) {
         p.max(b)
     };
     recheck_streamed_unwatched(&ranges, recheck_frame);
-    let wine_hash_committed = crate::util::under_wine() && TEXTURES_LEN.load(Ordering::Relaxed) > 0;
+    // the coherent window is not write-watched there (`uma::wine_amd_gpu`): its textures are hashed
+    let wine_hash_committed = crate::gpu::uma::wine_amd_gpu() && TEXTURES_LEN.load(Ordering::Relaxed) > 0;
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 && !wine_hash_committed {
         return;
     }

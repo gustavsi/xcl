@@ -267,8 +267,8 @@ impl Uma {
             win_allocs.push(base);
             // Under Wine without userfaultfd, MEM_WRITE_WATCH uses mprotect(PROT_READ), which
             // triggers amdgpu userptr MMU-notifier evictions and ~100ms GPU stalls on the
-            // coherent window imported via OpenExistingHeapFromAddress.
-            let c_flags = if crate::util::under_wine() { MEM_RESERVE | MEM_COMMIT } else { MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH };
+            // coherent window imported via OpenExistingHeapFromAddress (`wine_amd_gpu`).
+            let c_flags = if wine_amd_gpu() { MEM_RESERVE | MEM_COMMIT } else { MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH };
             let mut ok = true;
             for (c, &c_size) in coh_sizes.iter().enumerate() {
                 let c_base = base + (sparse_wins + c) * WINDOW;
@@ -499,7 +499,7 @@ impl Uma {
             for k in 0..windows {
                 let want = base + k * WINDOW;
                 // write-watched: textures the title keeps here are uploaded again after CPU writes
-                let c_flags = if crate::util::under_wine() { MEM_RESERVE | MEM_COMMIT } else { MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH };
+                let c_flags = if wine_amd_gpu() { MEM_RESERVE | MEM_COMMIT } else { MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH };
                 let p = unsafe { VirtualAlloc(want as *const std::ffi::c_void, size, c_flags, PAGE_READWRITE) };
                 if p.is_null() {
                     break;
@@ -571,7 +571,7 @@ impl Uma {
             match self.kinds[k] {
                 WindowKind::None => k += 1,
                 WindowKind::Committed(s) => {
-                    if !crate::util::under_wine() {
+                    if !wine_amd_gpu() {
                         out.push((self.base + k * WINDOW, s));
                     }
                     k += 1;
@@ -794,30 +794,25 @@ fn coherent_file() -> std::path::PathBuf {
     crate::state::data_dir().join("cache").join("uma_coherent.txt")
 }
 
-/// Whether this process is running under Wine on an AMD GPU (`amdgpu`, PCI vendor `0x1002`).
+/// Whether this process is running under Wine and XCL's D3D12 adapter (`d3d12_adapter` /
+/// `XCL_ADAPTER`, as `real::init` picks it) is an AMD GPU (`amdgpu`, PCI vendor `0x1002`).
 /// On `amdgpu`, a multi-GiB `userptr` BO imported via `OpenExistingHeapFromAddress` stalls
-/// every Vulkan submission (~150 ms/frame), whereas NVIDIA Linux does not hit that stall and
-/// benefits from a larger coherent window.
-fn wine_amd_gpu() -> bool {
+/// every Vulkan submission (~150 ms/frame), and write-watching it (`mprotect`) evicts it; NVIDIA
+/// Linux does not hit that stall and keeps a larger, write-watched coherent window.
+pub(crate) fn wine_amd_gpu() -> bool {
     static AMD: OnceLock<bool> = OnceLock::new();
     *AMD.get_or_init(|| {
         if !crate::util::under_wine() {
             return false;
         }
-        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE};
-        let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+        use crate::gpu::adapter::{self, Selector};
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, IDXGIFactory6, DXGI_CREATE_FACTORY_FLAGS};
+        let Ok(factory) = (unsafe { CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) }) else {
             return false;
         };
-        let mut i = 0u32;
-        while let Ok(adapter) = unsafe { factory.EnumAdapters1(i) } {
-            i += 1;
-            if let Ok(desc) = unsafe { adapter.GetDesc1() } {
-                if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) == 0 {
-                    return desc.VendorId == 0x1002;
-                }
-            }
-        }
-        false
+        let hw: Vec<(String, u32)> = adapter::hardware(&factory).iter().map(|(_, d)| (adapter::name(d), d.VendorId)).collect();
+        let sel = Selector::from_env_or(&crate::state::config().d3d12_adapter);
+        adapter::chosen_vendor(&hw, &sel) == Some(0x1002)
     })
 }
 
@@ -1147,8 +1142,8 @@ mod tests {
         assert_eq!(u.sparse_release(desc), Some(GRAIN));
         assert_eq!(u.sparse_used(), 0);
         // Contiguous sparse windows 0..2 are reported as one OS watch region; window 3 as another
-        // on native Windows (excluded under Wine to avoid amdgpu userptr MMU-notifier stalls).
-        let expected = if crate::util::under_wine() {
+        // on native Windows (excluded under Wine on amdgpu to avoid userptr MMU-notifier stalls).
+        let expected = if wine_amd_gpu() {
             vec![(u.base(), 3 * WINDOW)]
         } else {
             vec![(u.base(), 3 * WINDOW), (u.base() + 3 * WINDOW, 16 << 20)]
@@ -1186,7 +1181,7 @@ mod tests {
             assert_eq!(u.sparse_release(d), Some(ld));
             assert_eq!(u.sparse_release(r), Some(big));
             assert_eq!(u.sparse_used(), 0);
-            let expected = if crate::util::under_wine() {
+            let expected = if wine_amd_gpu() {
                 vec![(u.base(), MAX_RUNTIME_SPARSE_WINDOWS * WINDOW)]
             } else {
                 vec![
