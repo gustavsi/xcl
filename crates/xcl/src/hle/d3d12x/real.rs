@@ -525,6 +525,7 @@ pub fn init() -> Result<String, String> {
             }
             for (adapter, desc) in list {
                 if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
+                    driver_cache::note_vendor(desc.VendorId);
                     device = Some(dev);
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
                     break;
@@ -4999,7 +5000,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
 /// and the program compiled as before). `XCL_PSO_DISK_CACHE=0`: off.
 pub(crate) mod driver_cache {
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// builds shorter than this are not worth a file
     const KEEP: std::time::Duration = std::time::Duration::from_millis(250);
@@ -5024,9 +5025,38 @@ pub(crate) mod driver_cache {
         format!("gfx-{hash:016x}-{bytes:x}.pso")
     }
 
+    /// The device's driver hands out blobs that hold no code, only a reference into its own
+    /// shader cache: AMD's are 954 bytes whatever the program (#2512). Its cache finds a pipeline
+    /// by its DXIL without them, and a reference written by a run that crashed or was killed can
+    /// be stale: handed back, it removed the device instead of being refused. Such blobs are not
+    /// kept on disk (`XCL_PSO_DISK_CACHE=1` keeps them all the same).
+    static STUBS: AtomicBool = AtomicBool::new(false);
+
+    /// The vendor of the adapter the device was made on (DXGI_ADAPTER_DESC1::VendorId).
+    pub fn note_vendor(vendor: u32) {
+        let stubs = stub_vendor(vendor);
+        let was = STUBS.swap(stubs, Ordering::Relaxed);
+        if stubs && !was && !enabled() {
+            crate::xlog_info!("D3D12.X: an AMD driver's pipeline blobs only name entries of its own cache – none kept on disk (XCL_PSO_DISK_CACHE=1 keeps them)");
+        }
+    }
+
+    fn stub_vendor(vendor: u32) -> bool {
+        vendor == 0x1002
+    }
+
+    /// `XCL_PSO_DISK_CACHE`: "0" off, "1" on, unset: on unless the driver's blobs are references
+    fn env_setting() -> Option<bool> {
+        static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").ok().map(|v| v.trim() != "0"))
+    }
+
+    fn enabled_with(setting: Option<bool>, stubs: bool) -> bool {
+        setting.unwrap_or(!stubs)
+    }
+
     fn enabled() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0"))
+        enabled_with(env_setting(), STUBS.load(Ordering::Relaxed))
     }
 
     pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
@@ -5115,6 +5145,18 @@ pub(crate) mod driver_cache {
         struct Directory(PathBuf);
         impl Drop for Directory {
             fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+
+        /// An AMD driver's blobs are references into its own cache: none on disk unless asked for;
+        /// other drivers' (code) are kept unless turned off.
+        #[test]
+        fn blobs_are_kept_on_disk_unless_they_are_references() {
+            assert!(stub_vendor(0x1002), "AMD");
+            assert!(!stub_vendor(0x10DE) && !stub_vendor(0x8086) && !stub_vendor(0x1414), "NVIDIA, Intel, WARP");
+            assert!(enabled_with(None, false));
+            assert!(!enabled_with(None, true));
+            assert!(enabled_with(Some(true), true), "XCL_PSO_DISK_CACHE=1 keeps them");
+            assert!(!enabled_with(Some(false), false), "XCL_PSO_DISK_CACHE=0 turns them off");
         }
 
         #[test]
@@ -10027,5 +10069,74 @@ mod pso_release_tests {
         }
         assert_eq!(p.known_when_freed, Some(false));
         assert!(!is_translated_compute(this as usize));
+    }
+}
+
+#[cfg(test)]
+mod create_descriptor_heap_x_tests {
+    use super::*;
+
+    /// A `this` adopted the way `adopt()` records it: a CLASSES entry (what `slot_of` looks up)
+    /// and an ext stub whose `ext[-1]` is the fake "PC" vtable (what `orig_fn` reads). Only the
+    /// slots a call reaches need real entries.
+    struct FakeDevice {
+        _orig: Vec<usize>,
+        _ext: Vec<usize>,
+        obj: Box<usize>,
+        vtbl: usize,
+    }
+    impl FakeDevice {
+        fn this(&self) -> *mut c_void {
+            &*self.obj as *const usize as *mut c_void
+        }
+    }
+    impl Drop for FakeDevice {
+        fn drop(&mut self) {
+            CLASSES.lock().unwrap().retain(|c| c.ext != self.vtbl);
+            if let Some(g) = EXTS.lock().unwrap().as_mut() {
+                g.remove(&self.vtbl);
+            }
+        }
+    }
+    fn fake_device(orig: Vec<usize>) -> FakeDevice {
+        let ext = vec![orig.as_ptr() as usize, 0];
+        let vtbl = ext.as_ptr() as usize + 8;
+        CLASSES.lock().unwrap().push(Class {
+            orig: orig.as_ptr() as usize,
+            kind: Kind::Device,
+            ext: vtbl,
+            iface: layout::find("ID3D12Device").unwrap(),
+            public: 0,
+            scanned: 0,
+        });
+        EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(vtbl);
+        FakeDevice { _orig: orig, _ext: ext, obj: Box::new(vtbl), vtbl }
+    }
+
+    unsafe extern "system" fn create_heap_s_false(_this: *mut c_void, _desc: usize, _riid: *const GUID, _ppv: *mut *mut c_void) -> HRESULT {
+        S_FALSE
+    }
+
+    /// `CreateDescriptorHeap` with `ppv == NULL` is D3D12's validation call: the PC answers
+    /// S_FALSE and writes nothing. The console shim must pass it through, not read `*ppv`
+    /// (#2401 – it dereferenced it the moment `hr >= 0`).
+    #[test]
+    fn a_null_ppv_validation_call_passes_the_pc_answer_through() {
+        let iface = layout::find("ID3D12Device").unwrap();
+        let mut orig = vec![0usize; layout::slot(iface, "CreateDescriptorHeap").unwrap() + 1];
+        orig[layout::slot(iface, "CreateDescriptorHeap").unwrap()] = create_heap_s_false as usize;
+        let dev = fake_device(orig);
+        std::env::set_var("XCL_SHARED_SAMPLER_HEAP", "0");
+        let desc = [D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32, 4, 0, 0];
+        let riid = GUID::from_u128(0xdead_beef);
+        unsafe {
+            let hr = dev_create_descriptor_heap_x(dev.this(), &desc, &riid, std::ptr::null_mut());
+            assert_eq!(hr, S_FALSE);
+            // an out pointer the PC left NULL (S_FALSE writes nothing) is the same shape
+            let mut out: *mut c_void = std::ptr::null_mut();
+            let hr = dev_create_descriptor_heap_x(dev.this(), &desc, &riid, &mut out);
+            assert_eq!((hr, out.is_null()), (S_FALSE, true));
+        }
+        std::env::remove_var("XCL_SHARED_SAMPLER_HEAP");
     }
 }

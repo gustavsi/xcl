@@ -2757,9 +2757,6 @@ pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
     true
 }
 
-/// Builds of a submit's put-off calls that go on without the commit headroom, as a title thread's own do: about what the title's threads had in the driver at once before.
-const WANTED_AT_ONCE: usize = 4;
-
 /// Records the deferred dispatches of `wrapper`'s recording, waiting for their pipelines as a bind did.
 pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
     let mut segs = Vec::new();
@@ -2767,10 +2764,7 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
     let Some(&first) = segs.first() else { return };
     segs.retain(|&seg| seg == first || LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(seg as usize))).is_some_and(|s| s.deferred.is_some()));
     let mut last: Option<*mut c_void> = None;
-    for (i, &seg) in segs.iter().enumerate().skip(1) {
-        for &ahead in segs[i..].iter().take(WANTED_AT_ONCE) {
-            super::bind::want_bound(ahead);
-        }
+    for &seg in segs.iter().skip(1) {
         let Some((what, ty, heaps)) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(seg as usize))).and_then(|s| Some((s.deferred.take()?, s.list_type?, s.bindings.heaps.clone()))) else {
             continue;
         };
@@ -2946,7 +2940,9 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     let old_next = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
-        let old = m.remove(&(next_pc as usize));
+        let mut old = m.remove(&(next_pc as usize));
+        // (a spare that was a first segment keeps the allocator its deferred segments recorded on: the GPU may still run them)
+        let own_alloc = old.as_mut().and_then(|o| o.own_alloc.take());
         if let Some(ref o) = old {
             if !o.pending_waits.is_empty() {
                 PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
@@ -2977,6 +2973,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
                 pred_in_state: false,
                 predication,
                 bindings: bindings.clone(),
+                own_alloc,
                 ..Default::default()
             },
         );
@@ -3494,7 +3491,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         Some((primary, prior, reclaimed)) => (primary, prior, reclaimed),
         None => (this, Vec::new(), Vec::new()),
     };
-    let init_pso = if ty == D3D12_COMMAND_LIST_TYPE_COPY { 0 } else { super::pso_async::resolve_for_bind(bound_pso) };
+    let init_pso = if ty == D3D12_COMMAND_LIST_TYPE_COPY { 0 } else { super::pso_async::resolve(bound_pso) };
     let reset_one = |pc_list: *mut c_void| -> i32 {
         let ext_closed = *(pc_list as *const usize);
         let hr = super::alloc_pool::reset_list(pc_list as usize, alloc, list_type(pc_list).0, |pc_alloc| {
@@ -4434,7 +4431,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     // A failed native Reset leaves the old recording alive. Do not discard its tracked state or
     // transfer its allocations until the driver accepts the new recording.
     let ext = *(this as *const usize);
-    let resolved = super::pso_async::resolve_for_bind(pso);
+    let resolved = super::pso_async::resolve(pso);
     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
     let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
     let mut on = alloc;
@@ -4898,6 +4895,11 @@ pub(super) unsafe extern "system" fn begin_query_x(this: *mut c_void, heap: usiz
         }
     }
     pc::<QueryFn>(this, PC_BEGIN_QUERY)(this, heap, ty, index);
+}
+
+#[cfg(test)]
+pub(super) fn forced_visible_for_test(heap: usize, index: u32) -> bool {
+    VISIBLE.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&(heap, index)))
 }
 
 /// command list #29 EndQuery(heap, type, index) (PC #53)
@@ -7598,6 +7600,151 @@ mod tests {
             queue.Signal(&done, 1).unwrap();
             crate::gpu::fence::wait(&done, 1, &dev, None, 2000).expect("the split list runs");
 
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            assert_eq!(rel_fn(wrap), 0);
+            let _ = pso_async::released(standin);
+        }
+    }
+
+    /// A recording's first segment stood in for its primary list and holds the allocator its
+    /// deferred dispatches recorded on. At the next Reset it goes to the spares; a split of a later
+    /// recording reuses it while those dispatches still run on the GPU (a block after a Wait64).
+    /// The allocator must outlive them.
+    #[test]
+    fn a_spare_reused_by_a_split_keeps_an_own_allocator_still_on_the_gpu() {
+        use super::super::{alloc_pool, bind, title_list};
+
+        let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        unsafe {
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let a = alloc.as_raw() as usize;
+            let new_list = |on: &ID3D12CommandAllocator| {
+                let l = dev.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(0, ty, on, None).unwrap().into_raw();
+                real::adopt(l, real::Kind::CommandList);
+                on_create(l, on.as_raw() as usize, 0, ty);
+                l
+            };
+            // the old first segment and the allocator of its deferred segments
+            let own: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let spare = new_list(&alloc);
+            assert_eq!(pc::<unsafe extern "system" fn(*mut c_void) -> i32>(spare, PC_CLOSE)(spare), 0);
+            let primary = new_list(&alloc);
+            bind::reset(primary, a, 0);
+            let w = title_list::wrap(primary);
+            LISTS.lock().unwrap().as_mut().unwrap().get_mut(&(spare as usize)).unwrap().own_alloc = Some(own.clone());
+            title_list::put_spare(w, spare);
+
+            // a deferred segment recorded on it, held on the GPU behind a queue Wait
+            let deferred = new_list(&own);
+            assert_eq!(pc::<unsafe extern "system" fn(*mut c_void) -> i32>(deferred, PC_CLOSE)(deferred), 0);
+            let gate: ID3D12Fence = real::create_raw_fence(&dev).unwrap();
+            let done: ID3D12Fence = real::create_raw_fence(&dev).unwrap();
+            let exec: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
+                std::mem::transmute(*(*(q.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
+            q.Wait(&gate, 1).unwrap();
+            {
+                let _g = real::UnadoptGuard::new(deferred);
+                exec(q.as_raw(), 1, &deferred);
+            }
+            alloc_pool::executed(q.as_raw(), &[deferred]);
+            assert!(alloc_pool::allocator_in_flight(own.as_raw() as usize));
+
+            // a later recording splits and gets the spare (its own submit is done)
+            let next = split(primary, None);
+            assert_eq!(next, Some(spare), "the split reuses the spare");
+            // (this test holds one reference; the spare's state held the other)
+            let refs = (Interface::vtable(&own).base__.base__.base__.base__.AddRef)(own.as_raw());
+            (Interface::vtable(&own).base__.base__.base__.base__.Release)(own.as_raw());
+
+            gate.Signal(1).unwrap();
+            q.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 5000).expect("the queue finishes");
+            let removed = dev.GetDeviceRemovedReason();
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(w as *const *const usize)).add(2));
+            assert_eq!(release(w), 0);
+            drop(ID3D12GraphicsCommandList::from_raw(deferred));
+
+            assert_eq!(refs, 3, "the allocator of work still on the GPU stays held");
+            assert!(removed.is_ok());
+        }
+    }
+
+    #[test]
+    fn a_reset_with_a_compute_pipeline_still_building_does_not_wait() {
+        use super::super::{bind, pso_async, title_list};
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
+                if warp.and_then(|w| D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev)).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            if crate::gpu::recomp::dxc::location().is_err() {
+                crate::gpu::recomp::runner::skip_test("no DXC");
+                return;
+            }
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).unwrap();
+
+            // the shared driver pipeline a stand-in binds in its place (`standin::shell`)
+            let dxil = crate::gpu::recomp::dxc::compile("[RootSignature(\"RootFlags(0)\")] [numthreads(1, 1, 1)] void main() {}", "main", "cs_6_0", &[]).unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).unwrap();
+            let driver: ID3D12PipelineState = dev
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: transmute_copy(&rs),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                })
+                .unwrap();
+            let standin = 0x7E57_D002usize;
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            pso_async::submit(
+                standin,
+                true,
+                Box::new(|| {
+                    let t = Instant::now();
+                    while !BUILD.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(10) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    0
+                }),
+            );
+            pso_async::shared(standin, driver.as_raw() as usize);
+            let pc0 = raw.into_raw();
+            real::adopt(pc0, real::Kind::CommandList);
+            on_create(pc0, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            let list = ID3D12GraphicsCommandList::from_raw_borrowed(&pc0).unwrap();
+            list.Close().unwrap();
+
+            let t = Instant::now();
+            let hr = reset_pc(pc0, alloc.as_raw() as usize, standin);
+            assert!(t.elapsed() < Duration::from_millis(700), "Reset waited for the build ({:?})", t.elapsed());
+            assert!(hr >= 0, "Reset failed ({hr:#x})");
+            assert!(pso_async::is_pending(standin), "Reset waited for the build");
+            assert_eq!(LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(pc0 as usize))).map(|s| s.bound_pso), Some(standin));
+
+            // the dispatch that follows is still left for the submit, as after a SetPipelineState
+            let wrap = title_list::wrap(pc0);
+            let t = Instant::now();
+            bind::dispatch(pc0, 1, 1, 1);
+            assert!(t.elapsed() < Duration::from_millis(700), "the dispatch waited for the build ({:?})", t.elapsed());
+            assert!(pso_async::is_pending(standin));
+            let mut segs = Vec::new();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 3, "the list before the dispatch, the dispatch, the list after it");
+
+            BUILD.store(true, Ordering::Release);
             let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
             assert_eq!(rel_fn(wrap), 0);
             let _ = pso_async::released(standin);

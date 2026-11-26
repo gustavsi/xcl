@@ -794,6 +794,28 @@ mod used_tests {
         assert!(!build_is_wanted(), "the bind has finished");
     }
 
+    #[test]
+    fn a_build_a_submit_needs_is_wanted() {
+        let standin = 0x7E57_B007usize;
+        let (started_tx, started) = mpsc::channel();
+        submit(standin, true, Box::new(move || {
+            started_tx.send(()).unwrap();
+            let t = std::time::Instant::now();
+            while !build_is_wanted() && t.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if build_is_wanted() { 0x5757 } else { 0 }
+        }));
+        started.recv().unwrap();
+        need_by_submit(standin);
+        let t = std::time::Instant::now();
+        while is_pending(standin) && t.elapsed() < std::time::Duration::from_secs(15) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(resolve(standin), 0x5757, "the build did not hear that a submit waits for it");
+        let _ = released(standin);
+    }
+
     /// A worker's build hears that a bind waits for it (and only its own build does).
     #[test]
     fn a_waiting_bind_makes_the_build_wanted() {
@@ -1247,17 +1269,17 @@ pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
 }
 
-/// One of the title's threads is about to wait for `pso`.
-pub fn want(pso: usize) {
-    if let Some(p) = entry(pso) {
-        p.want();
-    }
+/// `pso` is a stand-in with no real pipeline: still being built, or its build failed (it draws nothing).
+pub fn is_stand_in(pso: usize) -> bool {
+    entry(pso).is_some_and(|p| p.real.load(Ordering::Acquire) == 0)
 }
 
-/// A call with `pso` was put off to the submit: its build goes before the workers' queue.
+/// A call with `pso` was put off to the submit, which will wait for it: its build goes before the
+/// workers' queue, as a wanted one.
 pub fn need_by_submit(pso: usize) {
     let Some(p) = entry(pso) else { return };
     if !std::mem::replace(&mut p.demand.lock().unwrap().by_submit, true) {
+        p.want();
         NEEDED.lock().unwrap().push_back(p);
         let _ = queue().lock().unwrap().send(Box::new(|| ()));
     }
