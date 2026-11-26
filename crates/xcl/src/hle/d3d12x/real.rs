@@ -866,7 +866,7 @@ pub(crate) struct UnadoptGuard {
 
 impl UnadoptGuard {
     pub(crate) unsafe fn new(obj: *mut c_void) -> Option<Self> {
-        if !crate::util::under_wine() || obj.is_null() || !crate::gpu::shader::readable(obj as usize, 8) {
+        if !crate::util::under_wine() || obj.is_null() || (obj as usize) & 7 != 0 || !crate::gpu::shader::readable(obj as usize, 8) {
             return None;
         }
         let mut g = UNADOPTED.lock().unwrap();

@@ -7932,12 +7932,18 @@ mod tests {
                 real::adopt(a_title.as_raw(), real::Kind::CommandAllocator);
             }
 
-            let l_hold: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &a_title, None).unwrap();
+            let l_hold: ID3D12GraphicsCommandList = {
+                let _g = real::UnadoptGuard::new(a_title.as_raw());
+                dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &a_title, None).unwrap()
+            };
             real::adopt(l_hold.as_raw(), real::Kind::CommandList);
             on_create(l_hold.as_raw(), a_raw, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
             l_hold.Close().unwrap();
 
-            let raw_c: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &a_title, None).unwrap();
+            let raw_c: ID3D12GraphicsCommandList = {
+                let _g = real::UnadoptGuard::new(a_title.as_raw());
+                dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &a_title, None).unwrap()
+            };
             let pc_c0 = raw_c.into_raw();
             real::adopt(pc_c0, real::Kind::CommandList);
             on_create(pc_c0, a_raw, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
@@ -8348,7 +8354,10 @@ mod tests {
         on_queue_create(q_raw as usize, dev.as_raw() as usize, ty);
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
         let a = alloc.as_raw() as usize;
-        let primary = dev.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(0, ty, &alloc, None).unwrap().into_raw();
+        let primary = {
+            let _g = real::UnadoptGuard::new(alloc.as_raw());
+            dev.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(0, ty, &alloc, None).unwrap().into_raw()
+        };
         real::adopt(primary, real::Kind::CommandList);
         on_create(primary, a, 0, ty);
         super::super::bind::reset(primary, a, 0);
@@ -8356,8 +8365,8 @@ mod tests {
             s.last_queue = Some(q_raw as usize);
         }
         let w = super::super::title_list::wrap(primary);
-        let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
-        let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        let gate: ID3D12Fence = real::create_raw_fence(dev).unwrap();
+        let done: ID3D12Fence = real::create_raw_fence(dev).unwrap();
         (q, alloc, primary, w, gate, done)
     }
 
