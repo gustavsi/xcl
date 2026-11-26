@@ -340,6 +340,8 @@ mod tests {
                 rb_alloc,
                 rb_list,
                 rb_last_fence: 0,
+                rb_seq: 0,
+                last_rb: FxHashMap::default(),
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),

@@ -1719,16 +1719,22 @@ unsafe fn ensure_cell_fence(va: u64, dev: &ID3D12Device, dev_raw: usize) -> Opti
         }
     }
     let created: ID3D12Fence = real::create_raw_fence(&dev).ok()?;
-    let mut g = SYNC_GRAPH.lock().unwrap();
-    let cell = g.get_or_insert_with(SyncGraph::default).cells.entry(va).or_default();
-    if cell.non_monotonic {
-        return None;
+    let installed = {
+        let mut g = SYNC_GRAPH.lock().unwrap();
+        let cell = g.get_or_insert_with(SyncGraph::default).cells.entry(va).or_default();
+        if cell.non_monotonic {
+            return None;
+        }
+        if let Some(ref existing) = cell.fence {
+            return (cell.device == dev_raw).then(|| existing.clone());
+        }
+        cell.fence = Some(created.clone());
+        cell.device = dev_raw;
+        true
+    };
+    if installed {
+        real::track_end_title_fence(&created);
     }
-    if let Some(ref existing) = cell.fence {
-        return (cell.device == dev_raw).then(|| existing.clone());
-    }
-    cell.fence = Some(created.clone());
-    cell.device = dev_raw;
     Some(created)
 }
 

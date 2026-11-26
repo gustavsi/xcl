@@ -45,6 +45,10 @@ pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
         (!root.join("shaders.rpf").try_exists().map_err(|e| e.to_string())? && !root.join("shaders").is_dir()) {
         return Ok(());
     }
+    if std::env::var("XCL_PREPARE").is_ok_and(|v| v.trim() == "0") {
+        crate::xlog_info!("Shader preparation left out (XCL_PREPARE=0): the title builds what it uses as it goes");
+        return Ok(());
+    }
     let progress = Arc::new(LaunchPreparation { adapter: boot.config.d3d12_adapter.clone(), ..Default::default() });
     let hwnd = if super::enabled() {
         *SCREEN.lock().unwrap() = Some(Screen { progress: progress.clone(), start: Instant::now(), clock: StallClock::default(), ready: false });

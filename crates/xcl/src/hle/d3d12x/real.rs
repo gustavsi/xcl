@@ -858,6 +858,13 @@ pub(super) unsafe fn readopt(obj: *mut c_void, kind: Kind) {
 /// last guard drops.
 static UNADOPTED: Mutex<Option<HashMap<usize, (usize, u32)>>> = Mutex::new(None);
 
+/// Whether `UnadoptGuard` should leave a vtable pointer alone: non-extended tables (not adopted)
+/// and runtime-owned vtables patched in place (whose `cur[-1]` is not an original-vtable slot).
+#[inline]
+fn skips_guard(cur: usize) -> bool {
+    !is_ext_fast(cur) || in_place_original(cur, 0).is_some()
+}
+
 /// Temporarily restores an adopted object's native vtable for a call into `d3d12core.dll`
 /// (vkd3d-proton validates `iface->lpVtbl` on command allocators and command lists).
 pub(crate) struct UnadoptGuard {
@@ -876,10 +883,15 @@ impl UnadoptGuard {
             return Some(Self { obj });
         }
         let cur = (*(obj as *const AtomicUsize)).load(Ordering::Acquire);
-        if !is_ext_fast(cur) || in_place_original(cur, 0).is_some() {
+        if skips_guard(cur) {
             return None;
         }
         let orig = *(cur as *const usize).sub(1);
+        // Pin +1 COM ref via native AddRef before exposing `orig`, so a concurrent thread
+        // loading `orig` and calling native Release cannot finalize the object without XCL's
+        // hooked Release cleanup running.
+        let add: RefFn = std::mem::transmute(*(orig as *const usize).add(1));
+        add(obj);
         register_native(orig);
         (*(obj as *const AtomicUsize)).store(orig, Ordering::Release);
         map.insert(obj as usize, (cur, 1));
@@ -896,6 +908,8 @@ impl UnadoptGuard {
         }
         let ext = (*(obj as *const AtomicUsize)).load(Ordering::Acquire);
         let orig = *(ext as *const usize).sub(1);
+        let add: RefFn = std::mem::transmute(*(orig as *const usize).add(1));
+        add(obj);
         register_native(orig);
         (*(obj as *const AtomicUsize)).store(orig, Ordering::Release);
         map.insert(obj as usize, (ext, 1));
@@ -905,17 +919,31 @@ impl UnadoptGuard {
 
 impl Drop for UnadoptGuard {
     fn drop(&mut self) {
-        let mut g = UNADOPTED.lock().unwrap();
-        if let Some(map) = g.as_mut() {
-            if let Some((ext, count)) = map.get_mut(&(self.obj as usize)) {
-                *count -= 1;
-                if *count == 0 {
-                    let ext = *ext;
-                    map.remove(&(self.obj as usize));
-                    unsafe {
-                        (*(self.obj as *const AtomicUsize)).store(ext, Ordering::Release);
+        let release_ext = {
+            let mut g = UNADOPTED.lock().unwrap();
+            let mut out = None;
+            if let Some(map) = g.as_mut() {
+                if let Some((ext, count)) = map.get_mut(&(self.obj as usize)) {
+                    *count -= 1;
+                    if *count == 0 {
+                        let ext = *ext;
+                        map.remove(&(self.obj as usize));
+                        unsafe {
+                            (*(self.obj as *const AtomicUsize)).store(ext, Ordering::Release);
+                        }
+                        out = Some(ext);
                     }
                 }
+            }
+            out
+        };
+        // Release the pinned reference outside `UNADOPTED` through XCL's hooked Release slot
+        // so any final 1 -> 0 drop runs XCL's cleanup bookkeeping (`pso_release`, `heap_release`,
+        // `res_release`, `cl_release`, `alloc_release`).
+        if let Some(ext) = release_ext {
+            unsafe {
+                let rel: RefFn = std::mem::transmute(*(ext as *const usize).add(2));
+                rel(self.obj);
             }
         }
     }
@@ -4032,7 +4060,7 @@ unsafe fn unwrap_fence_proxy(p: *mut c_void) -> *mut c_void {
 /// and passed to native APIs without hitting `FenceProxy` vtable mismatches.
 pub(super) unsafe fn create_raw_fence(dev: &ID3D12Device) -> windows::core::Result<ID3D12Fence> {
     let raw = dev.as_raw();
-    if is_ext(vt(raw) as usize) {
+    if crate::util::under_wine() && is_ext(vt(raw) as usize) {
         type F = unsafe extern "system" fn(*mut c_void, u64, D3D12_FENCE_FLAGS, *const GUID, *mut *mut c_void) -> HRESULT;
         let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "CreateFence")));
         let mut out: *mut c_void = std::ptr::null_mut();
@@ -4043,6 +4071,19 @@ pub(super) unsafe fn create_raw_fence(dev: &ID3D12Device) -> windows::core::Resu
         return Ok(ID3D12Fence::from_raw(out));
     }
     dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
+}
+
+/// Remember a raw fence (e.g. a `list_x` cell fence created via `create_raw_fence` under Wine)
+/// in `FENCES` so `end_title` signals it to `u64::MAX` before `drain_gpu`. No-op if already
+/// tracked (e.g. off Wine, where `create_raw_fence` goes through `dev_create_fence`).
+pub(super) unsafe fn track_end_title_fence(fence: &ID3D12Fence) {
+    let raw = fence.as_raw();
+    let mut g = FENCES.write().unwrap();
+    if !g.contains(&(raw as usize)) {
+        let add: RefFn = std::mem::transmute(*vt(raw).add(1));
+        add(raw);
+        g.push(raw as usize);
+    }
 }
 
 /// fences created through the device (AddRef'd: they are released at the end only)
@@ -8694,6 +8735,92 @@ mod in_place_tests {
         }
         assert_eq!(registered.get(), 1, "registered once, before the first write");
     }
+
+    #[test]
+    fn concurrent_calls_and_patches_on_readonly_vtable_never_tear_or_miss_orig_fn() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE};
+
+        unsafe extern "system" fn orig_slot(_this: *mut c_void) -> usize {
+            0x1111_0001
+        }
+        unsafe extern "system" fn hook_slot(this: *mut c_void) -> usize {
+            let f: unsafe extern "system" fn(*mut c_void) -> usize = std::mem::transmute(orig_fn(this, 1));
+            f(this) + 1
+        }
+
+        unsafe {
+            let mem = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut usize;
+            assert!(!mem.is_null());
+            for i in 0..8 {
+                mem.add(i).write(orig_slot as usize);
+            }
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(mem as *const c_void, 4096, PAGE_READONLY, &mut old), 0);
+
+            let obj_box = Box::leak(Box::new([mem as usize]));
+            let obj_addr = obj_box.as_mut_ptr() as usize;
+            let table_addr = mem as usize;
+
+            let barrier = Arc::new(Barrier::new(6));
+            let stop = Arc::new(AtomicBool::new(false));
+            let hook_hits = Arc::new(AtomicUsize::new(0));
+            let reg_count = Arc::new(AtomicUsize::new(0));
+
+            let mut callers = Vec::new();
+            for _ in 0..4 {
+                let b = barrier.clone();
+                let s = stop.clone();
+                let hits = hook_hits.clone();
+                callers.push(std::thread::spawn(move || {
+                    b.wait();
+                    let obj = obj_addr as *mut c_void;
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while std::time::Instant::now() < until {
+                        let vt = (*(obj as *const AtomicUsize)).load(Ordering::Acquire) as *const AtomicUsize;
+                        let fp = (*vt.add(1)).load(Ordering::Acquire);
+                        let f: unsafe extern "system" fn(*mut c_void) -> usize = std::mem::transmute(fp);
+                        let r = f(obj);
+                        assert!(r == 0x1111_0001 || r == 0x1111_0002, "unexpected slot result {r:#x}");
+                        if r == 0x1111_0002 {
+                            hits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if s.load(Ordering::Relaxed) && hits.load(Ordering::Relaxed) > 0 {
+                            break;
+                        }
+                    }
+                }));
+            }
+
+            let mut patchers = Vec::new();
+            for _ in 0..2 {
+                let b = barrier.clone();
+                let rc = reg_count.clone();
+                patchers.push(std::thread::spawn(move || {
+                    b.wait();
+                    let entries = [orig_slot as usize, hook_slot as usize, orig_slot as usize, orig_slot as usize];
+                    patch_in_place(table_addr as *mut usize, &entries, || {
+                        register_ext(table_addr);
+                        rc.fetch_add(1, Ordering::SeqCst);
+                    })
+                }));
+            }
+
+            let results: Vec<Result<bool, String>> = patchers.into_iter().map(|h| h.join().unwrap()).collect();
+            stop.store(true, Ordering::Relaxed);
+            for h in callers {
+                h.join().unwrap();
+            }
+
+            assert_eq!(results.iter().filter(|r| matches!(r, Ok(true))).count(), 1, "exactly one thread patches: {results:?}");
+            assert_eq!(results.iter().filter(|r| matches!(r, Ok(false))).count(), 1, "other racer sees Ok(false): {results:?}");
+            assert_eq!(reg_count.load(Ordering::SeqCst), 1, "register runs exactly once");
+            assert!(hook_hits.load(Ordering::Relaxed) > 0, "callers must observe the patched hook");
+            assert!(skips_guard(table_addr), "UnadoptGuard must skip in-place patched vtables");
+            assert!(UnadoptGuard::new(obj_addr as *mut c_void).is_none(), "UnadoptGuard must skip in-place patched vtables");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -10192,33 +10319,144 @@ mod wine_vtable_tests {
 
     #[test]
     fn unadopt_guard_restores_native_vtable_and_reapplies_extended_on_drop() {
-        // Place a zero word immediately before `orig_vt` (matching vkd3d-proton's layout) so a
-        // buggy `orig_fn` that reads `native[-1]` would dereference null instead of `orig_vt[2]`.
+        #[repr(C)]
+        struct FakeObj {
+            vt: usize,
+            refs: AtomicU32,
+            hook_releases: AtomicU32,
+        }
+        unsafe extern "system" fn native_add_ref(this: *mut c_void) -> u32 {
+            (*(this as *const FakeObj)).refs.fetch_add(1, Ordering::AcqRel) + 1
+        }
+        unsafe extern "system" fn native_release(this: *mut c_void) -> u32 {
+            (*(this as *const FakeObj)).refs.fetch_sub(1, Ordering::AcqRel) - 1
+        }
+        unsafe extern "system" fn hooked_release(this: *mut c_void) -> u32 {
+            (*(this as *const FakeObj)).hook_releases.fetch_add(1, Ordering::AcqRel);
+            native_release(this)
+        }
+
         let mut orig_buf = [0usize; 9];
-        orig_buf[1 + 2] = 0xDEAD_BEEF_CAFE_0002;
+        orig_buf[1 + 1] = native_add_ref as usize;
+        orig_buf[1 + 2] = native_release as usize;
         let orig_vt = unsafe { orig_buf.as_ptr().add(1) as usize };
         let mut ext_buf = [0usize; 9];
         ext_buf[0] = orig_vt;
+        ext_buf[1 + 1] = native_add_ref as usize;
+        ext_buf[1 + 2] = hooked_release as usize;
         let ext_vt = unsafe { ext_buf.as_ptr().add(1) as usize };
-        let mut fake_obj = ext_vt;
-        let obj = &mut fake_obj as *mut usize as *mut c_void;
+        let mut fake = FakeObj { vt: ext_vt, refs: AtomicU32::new(1), hook_releases: AtomicU32::new(0) };
+        let obj = &mut fake as *mut FakeObj as *mut c_void;
 
         unsafe {
             assert_eq!(*(obj as *const usize), ext_vt);
             {
                 let g1 = UnadoptGuard::enter(obj);
                 assert_eq!(*(obj as *const usize), orig_vt);
-                // Overlapping guard on the same shared object must keep the native vtable until
-                // the last guard drops.
+                assert_eq!(fake.refs.load(Ordering::Acquire), 2, "guard must pin +1 COM ref");
                 let g2 = UnadoptGuard::enter(obj);
+                assert_eq!(fake.refs.load(Ordering::Acquire), 2, "nested guard reuses outer ref pin");
                 drop(g1);
                 assert_eq!(*(obj as *const usize), orig_vt, "first drop must not restore ext while g2 is active");
                 if crate::util::under_wine() {
-                    assert_eq!(orig_fn(obj, 2), 0xDEAD_BEEF_CAFE_0002, "orig_fn must read native slot while guarded");
+                    assert_eq!(orig_fn(obj, 2), native_release as usize, "orig_fn must read native slot while guarded");
                 }
                 drop(g2);
             }
             assert_eq!(*(obj as *const usize), ext_vt);
+            assert_eq!(fake.refs.load(Ordering::Acquire), 1, "refcount restored on drop");
+            assert_eq!(fake.hook_releases.load(Ordering::Acquire), 1, "drop releases via hooked Release slot");
+        }
+    }
+
+    #[test]
+    fn concurrent_release_during_unadopt_guard_still_runs_hooked_cleanup() {
+        #[repr(C)]
+        struct SharedPso {
+            vt: usize,
+            refs: AtomicU32,
+            cleanup_ran: AtomicU32,
+        }
+        unsafe extern "system" fn native_add_ref(this: *mut c_void) -> u32 {
+            (*(this as *const SharedPso)).refs.fetch_add(1, Ordering::AcqRel) + 1
+        }
+        unsafe extern "system" fn native_release(this: *mut c_void) -> u32 {
+            (*(this as *const SharedPso)).refs.fetch_sub(1, Ordering::AcqRel) - 1
+        }
+        unsafe extern "system" fn hooked_pso_release(this: *mut c_void) -> u32 {
+            let f: RefFn = std::mem::transmute(orig_fn(this, 2));
+            let rc = f(this);
+            if rc == 0 {
+                (*(this as *const SharedPso)).cleanup_ran.fetch_add(1, Ordering::AcqRel);
+            }
+            rc
+        }
+
+        let mut orig_buf = [0usize; 9];
+        orig_buf[1 + 1] = native_add_ref as usize;
+        orig_buf[1 + 2] = native_release as usize;
+        let orig_vt = unsafe { orig_buf.as_ptr().add(1) as usize };
+        let mut ext_buf = [0usize; 9];
+        ext_buf[0] = orig_vt;
+        ext_buf[1 + 1] = native_add_ref as usize;
+        ext_buf[1 + 2] = hooked_pso_release as usize;
+        let ext_vt = unsafe { ext_buf.as_ptr().add(1) as usize };
+
+        let mut pso = Box::new(SharedPso { vt: ext_vt, refs: AtomicU32::new(1), cleanup_ran: AtomicU32::new(0) });
+        let raw = pso.as_mut() as *mut SharedPso as usize;
+
+        unsafe {
+            let guard = UnadoptGuard::enter(raw as *mut c_void);
+            let concurrent_rc = std::thread::spawn(move || {
+                let p = raw as *mut c_void;
+                let vt_seen = (*(p as *const AtomicUsize)).load(Ordering::Acquire);
+                assert_eq!(vt_seen, orig_vt, "concurrent caller observes native vtable during guard");
+                let rel: RefFn = std::mem::transmute(*(vt_seen as *const usize).add(2));
+                rel(p)
+            })
+            .join()
+            .unwrap();
+            assert_eq!(concurrent_rc, 1, "pinned ref must prevent native Release from finalizing the object");
+            assert_eq!(pso.cleanup_ran.load(Ordering::Acquire), 0);
+
+            drop(guard);
+            assert_eq!((*(raw as *const AtomicUsize)).load(Ordering::Acquire), ext_vt, "extended vtable restored");
+            assert_eq!(pso.refs.load(Ordering::Acquire), 0, "final reference dropped on guard exit");
+            assert_eq!(pso.cleanup_ran.load(Ordering::Acquire), 1, "hooked pso_release cleanup must run on 1 -> 0");
+        }
+    }
+
+    #[test]
+    fn track_end_title_fence_registers_once_and_addrefs() {
+        #[repr(C)]
+        struct FakeFence {
+            vt: *const usize,
+            refs: AtomicU32,
+        }
+        unsafe extern "system" fn fake_add_ref(this: *mut c_void) -> u32 {
+            (*(this as *const FakeFence)).refs.fetch_add(1, Ordering::AcqRel) + 1
+        }
+        unsafe extern "system" fn fake_release(this: *mut c_void) -> u32 {
+            (*(this as *const FakeFence)).refs.fetch_sub(1, Ordering::AcqRel) - 1
+        }
+
+        let mut vt = [0usize; 4];
+        vt[1] = fake_add_ref as usize;
+        vt[2] = fake_release as usize;
+        let fake = Box::new(FakeFence { vt: vt.as_ptr(), refs: AtomicU32::new(1) });
+        let raw = &*fake as *const FakeFence as *mut c_void;
+
+        unsafe {
+            let borrowed = ID3D12Fence::from_raw_borrowed(&raw).expect("borrowed fake fence");
+            assert!(!is_fence(raw as usize));
+            track_end_title_fence(borrowed);
+            assert!(is_fence(raw as usize), "tracked raw fence must be visible to end_title");
+            assert_eq!(fake.refs.load(Ordering::Acquire), 2, "tracking must AddRef once");
+            track_end_title_fence(borrowed);
+            assert_eq!(fake.refs.load(Ordering::Acquire), 2, "duplicate tracking must be a no-op");
+            FENCES.write().unwrap().retain(|&f| f != raw as usize);
+            fake_release(raw);
+            assert_eq!(fake.refs.load(Ordering::Acquire), 1);
         }
     }
 
