@@ -9710,6 +9710,10 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // `present::note_execute` -> `late_release::drain_known` -> `vram::recycle_ready`, preventing
     // re-entrant lock self-deadlocks and keeping internal queues out of `present::QUEUES`.
     if n == 0 || lists.is_null() || super::title_textures::is_own_work() {
+        // XCL's own lists are made through the adopted device too: under Wine vkd3d-proton
+        // needs their native vtables for the submit (no-op elsewhere)
+        let _list_guards: Vec<_> =
+            if lists.is_null() { Vec::new() } else { std::slice::from_raw_parts(lists, n as usize).iter().filter_map(|&l| UnadoptGuard::new(l)).collect() };
         f(this, n, lists);
         stop_if_device_removed();
         return;
