@@ -177,6 +177,9 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     let pc = *((this as usize + F_BACKING) as *const *mut c_void);
     let f: unsafe extern "system" fn(*mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 9));
     let hr = f(pc);
+    if hr >= 0 {
+        super::title_textures::note_list_closed(this);
+    }
     let n = *((this as usize + F_RING_AT) as *const usize);
     if hr < 0 && n > 0 {
         let first = n.saturating_sub(RING);

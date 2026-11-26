@@ -801,6 +801,13 @@ impl Arena {
 
 static GLOBAL: OnceLock<Option<Uma>> = OnceLock::new();
 
+/// A process that holds no title memory (a shader preparation worker): `get` is None from here
+/// on, and nothing is reserved or committed for it (a run's region commits its coherent window).
+/// Before any `get`.
+pub fn leave_out() {
+    let _ = GLOBAL.set(None);
+}
+
 /// The title's graphics memory XCL places in the coherent window (`note_coherent_need`) is
 /// known only once it asks for it, and the window is committed when it is made: its size is
 /// what the title asked for in its last run (`<data>/cache/uma_coherent.txt`) and XCL's own
@@ -836,11 +843,22 @@ fn wine_amd_gpu() -> bool {
     })
 }
 
+/// Optional upper cap on the coherent window(s) in bytes (`XCL_COHERENT_CAP_MB`), keeping
+/// `uma_coherent.txt` auto-growth bounded so large general-purpose title heaps stay out of
+/// GPU-writable Window 3 when desired.
+fn coherent_cap_bytes(max_cap: usize) -> usize {
+    std::env::var("XCL_COHERENT_CAP_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|mb| (mb << 20).clamp(GRAIN, max_cap))
+        .unwrap_or(max_cap)
+}
+
 /// Bytes the coherent window(s) are made with for a runtime layout of `windows` windows.
 pub fn coherent_hint_for(windows: usize) -> usize {
-    let cap = max_coherent_bytes(windows);
+    let cap = coherent_cap_bytes(max_coherent_bytes(windows));
     if let Some(mb) = std::env::var("XCL_COHERENT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
-        return (mb << 20).clamp(GRAIN, cap);
+        return (mb << 20).clamp(GRAIN, max_coherent_bytes(windows));
     }
     // Under Wine/vkd3d-proton on Linux (amdgpu), a multi-GiB userptr BO imported via
     // OpenExistingHeapFromAddress stalls every GPU submission (~150 ms/frame); keep the
@@ -859,7 +877,7 @@ pub fn coherent_hint_for(windows: usize) -> usize {
             free_commit() >> 20,
             NEEDS_FOR_COHERENT_HEAPS >> 20
         );
-        return RUNTIME_COMMITTED_CAP;
+        return RUNTIME_COMMITTED_CAP.min(cap);
     }
     (title + RUNTIME_COMMITTED_CAP).min(cap)
 }

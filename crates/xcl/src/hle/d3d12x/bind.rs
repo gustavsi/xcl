@@ -212,8 +212,10 @@ struct State {
     prelude_draws: Vec<PreludeDrawJob>,
     prelude_owned: Option<PreludeEntry>,
     prelude_built: Option<ID3D12GraphicsCommandList>,
-    /// Dedicated non-pooled CUSTOM write-back L0 buffers backing prelude job tables when UMA is full
-    prelude_job_bufs: Vec<ID3D12Resource>,
+    /// CUSTOM write-back L0 blocks backing prelude job tables when UMA is full (`JobBlock`), and
+    /// the bytes used of the last one
+    prelude_job_bufs: Vec<JobBlock>,
+    prelude_job_used: u64,
     /// true after an `INDIRECT_ARGUMENT` transition has ordered prior writes on this list and
     /// no compute/mesh dispatch has run since (skips redundant `fresh_indirect_arguments` barriers
     /// across runs of consecutive indirect graphics draws).
@@ -317,7 +319,81 @@ static ALLOC_IO: Mutex<Option<HashMap<usize, Vec<IoBlock>>>> = Mutex::new(None);
 static FREE_IO: Mutex<Vec<IoBlock>> = Mutex::new(Vec::new());
 static ALLOC_PRELUDE: Mutex<Option<HashMap<usize, Vec<PreludeEntry>>>> = Mutex::new(None);
 static FREE_PRELUDE: Mutex<Vec<PreludeEntry>> = Mutex::new(Vec::new());
-static ALLOC_PRELUDE_JOBS: Mutex<Option<HashMap<usize, Vec<ID3D12Resource>>>> = Mutex::new(None);
+static ALLOC_PRELUDE_JOBS: Mutex<Option<HashMap<usize, Vec<JobBlock>>>> = Mutex::new(None);
+
+/// A block of CPU-visible GPU memory (CUSTOM write-back, L0) for prelude job tables when the
+/// title's unified memory is full, mapped for good. A retail title fills its coherent window,
+/// so every prelude took this path: one committed buffer of a few hundred bytes each (64 KiB of
+/// commit and ~0.5 ms each), 1 250 a second – a second of the title's threads in every two, and
+/// 2.5 GB of commit a minute until the system's memory ran out and the device was lost in a
+/// tile mapping it could not page for. Now tables are cut from 1 MiB blocks, and a block goes
+/// back to `FREE_JOB_BLOCKS` when the allocator its lists were recorded with is reset.
+pub(super) struct JobBlock {
+    buf: ID3D12Resource,
+    cpu: usize,
+    va: u64,
+    dev: usize,
+}
+// (the mapping stays valid while `buf` lives; it is written by the recording thread only)
+unsafe impl Send for JobBlock {}
+
+const JOB_BLOCK_BYTES: u64 = 1 << 20;
+/// blocks kept for reuse at most (64 MiB)
+const JOB_BLOCKS_KEPT: usize = 64;
+static FREE_JOB_BLOCKS: Mutex<Vec<JobBlock>> = Mutex::new(Vec::new());
+
+/// A job block of `dev`: a kept one, or a new one.
+unsafe fn job_block(dev: &ID3D12Device) -> Result<JobBlock, String> {
+    let key = dev.as_raw() as usize;
+    {
+        let mut free = FREE_JOB_BLOCKS.lock().unwrap();
+        if let Some(i) = free.iter().position(|b| b.dev == key) {
+            return Ok(free.swap_remove(i));
+        }
+    }
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_CUSTOM,
+        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+        MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+        CreationNodeMask: 1,
+        VisibleNodeMask: 1,
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: JOB_BLOCK_BYTES,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let mut buf: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None, &mut buf)
+        .map_err(|e| format!("prelude job block: {e}"))?;
+    let buf = buf.ok_or("prelude job block was null")?;
+    let _ = buf.SetName(windows::core::w!("xcl prelude job block (UMA full)"));
+    let mut mapped = std::ptr::null_mut();
+    let empty = D3D12_RANGE { Begin: 0, End: 0 };
+    buf.Map(0, Some(&empty), Some(&mut mapped)).map_err(|e| format!("prelude job block map: {e}"))?;
+    let va = buf.GetGPUVirtualAddress();
+    if va == 0 || mapped.is_null() {
+        return Err("prelude job block has no address".into());
+    }
+    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: prelude job tables outside unified memory (it is full): {n} blocks of 1 MiB made");
+    }
+    Ok(JobBlock { buf, cpu: mapped as usize, va, dev: key })
+}
+
+/// `blocks` back for reuse (their allocator was reset: the GPU is done with them); the rest are
+/// dropped outside the lock.
+fn keep_job_blocks(blocks: Vec<JobBlock>) {
+    recycle_into_pool(&FREE_JOB_BLOCKS, blocks, |pool, _| pool.len() < JOB_BLOCKS_KEPT);
+}
 
 fn hold_res_until_reset(allocator: usize, mut bufs: Vec<(ID3D12Resource, u64, usize)>) {
     if bufs.is_empty() || allocator == 0 {
@@ -341,8 +417,13 @@ fn hold_prelude_until_reset(allocator: usize, entry: Option<PreludeEntry>) {
     ALLOC_PRELUDE.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().push(entry);
 }
 
-fn hold_prelude_jobs_until_reset(allocator: usize, mut bufs: Vec<ID3D12Resource>) {
-    if bufs.is_empty() || allocator == 0 {
+fn hold_prelude_jobs_until_reset(allocator: usize, mut bufs: Vec<JobBlock>) {
+    if bufs.is_empty() {
+        return;
+    }
+    if allocator == 0 {
+        // (no allocator to wait for: not reused, dropped as before)
+        drop(bufs);
         return;
     }
     ALLOC_PRELUDE_JOBS.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().append(&mut bufs);
@@ -392,9 +473,11 @@ pub(super) fn release_allocator_res(allocator: usize) {
     if let Some(entries) = entries {
         recycle_into_pool(&FREE_PRELUDE, entries, |pool, _| pool.len() < FREE_PRELUDE_CAP);
     }
-    // Never pooled: drop outside lock so COM Release hooks cannot re-enter `ALLOC_PRELUDE_JOBS`.
+    // back to the pool, the overflow dropped outside the locks (COM Release hooks re-enter here)
     let job_bufs = ALLOC_PRELUDE_JOBS.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator));
-    drop(job_bufs);
+    if let Some(b) = job_bufs {
+        keep_job_blocks(b);
+    }
 }
 
 /// Whether `FREE_RES`, holding `count` buffers of `held` bytes, keeps one of `bytes` more.
@@ -627,6 +710,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         let prelude = s.prelude_owned.take();
         s.prelude_built = None;
         let job_bufs = std::mem::take(&mut s.prelude_job_bufs);
+        s.prelude_job_used = 0;
         s.inline_guard = None;
         s.root_va_cache = [(0, 0); 16];
         s.root_va_next = 0;
@@ -704,6 +788,7 @@ pub(super) fn rebind_allocator(list: *mut c_void, allocator: usize) {
         let prelude = s.prelude_owned.take();
         s.prelude_built = None;
         let job_bufs = std::mem::take(&mut s.prelude_job_bufs);
+        s.prelude_job_used = 0;
         if s.allocator == backing {
             for sl in &mut s.scratch {
                 sl.state = D3D12_RESOURCE_STATE_COMMON;
@@ -769,6 +854,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         let prelude = s.prelude_owned.take();
         s.prelude_built = None;
         let job_bufs = std::mem::take(&mut s.prelude_job_bufs);
+        s.prelude_job_used = 0;
         s.inline_guard = None;
         s.root_va_cache = [(0, 0); 16];
         s.root_va_next = 0;
@@ -834,6 +920,7 @@ pub(super) fn forget(list: *mut c_void) {
         hold_res_until_reset(s.allocator, s.res_retired);
         hold_io_until_reset(s.allocator, s.io_blocks);
         hold_prelude_until_reset(s.allocator, s.prelude_owned.take());
+        s.prelude_job_used = 0;
         hold_prelude_jobs_until_reset(s.allocator, std::mem::take(&mut s.prelude_job_bufs));
     }
 }
@@ -1308,6 +1395,19 @@ unsafe fn shared_record_buffer(dev: &ID3D12Device, need: u64) -> Result<(ID3D12R
     let buf = default_uav_buffer(dev, bytes, "shared two-pass record buffer")?;
     all.push((buf.clone(), bytes, key));
     Ok((buf, bytes))
+}
+
+/// The record buffer a two-pass ExecuteIndirect asks for (`XCL_TWO_PASS_LIST_MB`, 32 MiB): the
+/// groups past it are dropped on the GPU (`SCALE_ARGS_HLSL`). With a buffer of each list
+/// (`XCL_TWO_PASS_SHARED=0`) a retail title's world holds one for each of ~130 lists at once:
+/// 4.3 GB of a 16 GB card's video memory at 32 MiB, and the device was lost when it ran out.
+fn two_pass_indirect_bytes() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| two_pass_list_mb(std::env::var("XCL_TWO_PASS_LIST_MB").ok().as_deref())) << 20
+}
+
+fn two_pass_list_mb(v: Option<&str>) -> u64 {
+    v.and_then(|v| v.trim().parse::<u64>().ok()).filter(|&mb| mb > 0).map_or(32, |mb| mb.min(128))
 }
 
 /// The record buffer of this list for `need_bytes` (at most 128 MiB): buffer, address, bytes.
@@ -2483,40 +2583,26 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
                     return super::real::uma_va_of(p as usize).ok_or_else(|| "unified memory is not open on the GPU".into());
                 }
                 let alloc_bytes = (bytes.max(16) as u64).next_multiple_of(256);
-                let heap = D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_CUSTOM,
-                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
-                    CreationNodeMask: 1,
-                    VisibleNodeMask: 1,
-                };
-                let desc = D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: alloc_bytes,
-                    Height: 1,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                    ..Default::default()
-                };
-                let mut buf: Option<ID3D12Resource> = None;
-                dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None, &mut buf)
-                    .map_err(|e| format!("prelude job fallback buffer: {e}"))?;
-                let buf = buf.ok_or("prelude job fallback buffer was null")?;
-                let _ = buf.SetName(windows::core::w!("xcl prelude jobs (UMA full)"));
-                let mut mapped = std::ptr::null_mut();
-                let empty = D3D12_RANGE { Begin: 0, End: 0 };
-                buf.Map(0, Some(&empty), Some(&mut mapped)).map_err(|e| format!("prelude job fallback map: {e}"))?;
-                std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), mapped as *mut u8, bytes);
-                let written = D3D12_RANGE { Begin: 0, End: bytes };
-                buf.Unmap(0, Some(&written));
-                let va = buf.GetGPUVirtualAddress();
-                if va == 0 {
-                    return Err("prelude job fallback GPU VA is 0".into());
+                if alloc_bytes > JOB_BLOCK_BYTES {
+                    return Err(format!("a prelude job table of {bytes} B is larger than a job block"));
                 }
-                with(seg, |s| s.prelude_job_bufs.push(buf));
+                // a fresh block when the last one has no room (made outside the state lock: its
+                // creation goes through the device's hooks)
+                let fits = with(seg, |s| s.prelude_job_bufs.last().is_some() && s.prelude_job_used + alloc_bytes <= JOB_BLOCK_BYTES);
+                if !fits {
+                    let block = job_block(&dev)?;
+                    with(seg, |s| {
+                        s.prelude_job_bufs.push(block);
+                        s.prelude_job_used = 0;
+                    });
+                }
+                let (cpu, va) = with(seg, |s| {
+                    let b = s.prelude_job_bufs.last().expect("a job block");
+                    let at = s.prelude_job_used;
+                    s.prelude_job_used += alloc_bytes;
+                    (b.cpu + at as usize, b.va + at)
+                });
+                std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), cpu as *mut u8, bytes);
                 Ok(va)
             };
 
@@ -3531,7 +3617,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     _ => return Err("its arguments are not in a console buffer in unified memory".into()),
                 };
                 let record_bytes = tp.record.record_dwords() as u64 * 4;
-                let (res_buf, res_va, cap) = ensure_res_buffer(this, 32 << 20)?;
+                let (res_buf, res_va, cap) = ensure_res_buffer(this, two_pass_indirect_bytes())?;
                 let cap = record_groups(cap, record_bytes, tp.mesh_groups_per_record);
                 if cap == 0 {
                     return Err(format!("a record of {record_bytes} B does not fit the record buffer"));
@@ -4876,6 +4962,17 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// `XCL_TWO_PASS_LIST_MB`: 32 MiB unset, 0 or unreadable; at most 128 MiB.
+    #[test]
+    fn a_two_pass_indirect_record_buffer_takes_its_size_from_the_switch() {
+        assert_eq!(two_pass_list_mb(None), 32);
+        assert_eq!(two_pass_list_mb(Some("8")), 8);
+        assert_eq!(two_pass_list_mb(Some(" 16 ")), 16);
+        assert_eq!(two_pass_list_mb(Some("0")), 32);
+        assert_eq!(two_pass_list_mb(Some("x")), 32);
+        assert_eq!(two_pass_list_mb(Some("1000")), 128);
+    }
 
     #[test]
     fn inline_guard_batch_defaults_off_and_opts_in() {

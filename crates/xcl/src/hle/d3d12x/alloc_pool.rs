@@ -310,6 +310,7 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
         *v += 1;
         (f.clone(), *v)
     };
+    super::flight::signaled("title", key, &fence, value);
     for &l in lists {
         if let Some(&b) = s.of_list.get(&(l as usize)) {
             let entry = s.backings.entry(b).or_default();

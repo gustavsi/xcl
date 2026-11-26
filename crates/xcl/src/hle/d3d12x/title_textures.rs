@@ -444,6 +444,80 @@ static TEXTURES: Mutex<Table> = Mutex::new(Table::new());
 // The dirty-page scan consumes write-watch state for every submission thread.
 // Keep the scan, pending-list update and GPU uploads together.
 static REFRESH: Mutex<()> = Mutex::new(());
+
+/// `XCL_LOOK_SKIP` (on by default, `0`: off): a submit whose lists were all closed before the last
+/// write-watch look began, and not submitted since, takes no look of its own.
+///
+/// The look (`GetWriteWatch` over the title's memory XCL keeps in step) was 60 % of a retail
+/// title's frame in its world: ~6 ms at each of 80–100 submits a second. What the title wrote
+/// for a list it wrote before closing it, and a look that began after the close took those
+/// pages already; the next look takes the rest. A list submitted again (a recording the title
+/// runs twice, its data written anew in between) always looks, and so does the first submit of
+/// each frame.
+fn look_skip_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_LOOK_SKIP").map_or(true, |v| v.trim() != "0"))
+}
+
+fn now_us() -> u64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64 + 1
+}
+
+/// When the last finished look began (µs, `now_us`; 0: none yet), and the frame it was in.
+static LOOK_BEGAN_US: AtomicU64 = AtomicU64::new(0);
+static LOOK_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Each title list's last Close (µs) and whether it was submitted since.
+static CLOSED: Mutex<Option<std::collections::HashMap<usize, (u64, bool)>>> = Mutex::new(None);
+
+/// The title closed `list` (the object it submits).
+pub(super) fn note_list_closed(list: *mut c_void) {
+    if !look_skip_on() || list.is_null() {
+        return;
+    }
+    CLOSED.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(list as usize, (now_us(), false));
+}
+
+thread_local! {
+    /// The next `refresh` on this thread may leave its look out (`look_needed_for` said so).
+    static SKIP_LOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Before a submit of `lists`: whether its refresh needs a look of its own (then `refresh` looks;
+/// else it is told to leave it out). The lists count as submitted from here on.
+pub(super) fn decide_look(lists: &[*mut c_void]) {
+    if !look_skip_on() {
+        return;
+    }
+    let began = LOOK_BEGAN_US.load(Ordering::Acquire);
+    let same_frame = LOOK_FRAME.load(Ordering::Acquire) == super::present::presents();
+    let mut g = CLOSED.lock().unwrap();
+    let m = g.get_or_insert_with(std::collections::HashMap::new);
+    let mut skip = began != 0 && same_frame && !lists.is_empty();
+    for &l in lists {
+        match m.get_mut(&(l as usize)) {
+            Some((closed, submitted)) => {
+                if *submitted || *closed >= began {
+                    skip = false;
+                }
+                *submitted = true;
+            }
+            None => skip = false,
+        }
+    }
+    drop(g);
+    SKIP_LOOK.with(|c| c.set(skip));
+    static SKIPPED: AtomicU64 = AtomicU64::new(0);
+    static ALL: AtomicU64 = AtomicU64::new(0);
+    let all = ALL.fetch_add(1, Ordering::Relaxed) + 1;
+    if skip {
+        SKIPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    if all.is_power_of_two() && all >= 256 {
+        crate::xlog_info!("title textures: {} of {all} submits took no write-watch look of their own (XCL_LOOK_SKIP)", SKIPPED.load(Ordering::Relaxed));
+    }
+}
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen,
@@ -456,6 +530,14 @@ static UPLOADS: AtomicU64 = AtomicU64::new(0);
 /// Number of textures kept in title memory and uploads done so far.
 pub fn counts() -> (usize, u64) {
     (TEXTURES.lock().unwrap().by_res.len(), UPLOADS.load(Ordering::Relaxed))
+}
+
+/// The title textures kept in step that are committed resources of their own (not on shared
+/// `vram::Pages` tiles): how many, and their console size in bytes (memory accounting, #2688;
+/// the PC resource can take somewhat more).
+pub fn committed_bytes() -> (usize, u64) {
+    let t = TEXTURES.lock().unwrap();
+    t.by_res.values().chain(t.shadowed.values()).filter(|e| !e.placed).fold((0, 0), |(n, b), e| (n + 1, b + e.tex.size()))
 }
 
 /// Whether a non-depth render target / UAV texture is small enough to be a CPU-filled glyph or UI
@@ -932,6 +1014,8 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
 
 unsafe fn refresh_once(queue: *mut c_void) {
     reclaim_completed_on_queue(queue as usize);
+    // (taken first: a return below must not leave it for the next submit on this thread)
+    let skip_look = SKIP_LOOK.with(|c| c.replace(false));
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
@@ -939,6 +1023,8 @@ unsafe fn refresh_once(queue: *mut c_void) {
     }
     recheck_gpu_view_sources();
     let watch_t0 = std::time::Instant::now();
+    let look_began = now_us();
+    let look_frame = super::present::presents();
     let mut page = 0x1000u32;
     super::sparse::drain_lazy_commits_if_pending();
     let ranges = cached_watch_ranges(u);
@@ -950,9 +1036,11 @@ unsafe fn refresh_once(queue: *mut c_void) {
             if buf.len() < 16384 {
                 buf.resize(16384, std::ptr::null_mut());
             }
-            super::list_x::mirror_look_begin();
-            for &(base, size) in ranges.iter() {
-                take_written(base, size, &mut buf, &mut dirty, &mut page);
+            if !skip_look {
+                super::list_x::mirror_look_begin();
+                for &(base, size) in ranges.iter() {
+                    take_written(base, size, &mut buf, &mut dirty, &mut page);
+                }
             }
         });
         // views of physical pages are not write-watched: their writes are caught by guards
@@ -964,6 +1052,12 @@ unsafe fn refresh_once(queue: *mut c_void) {
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    if !skip_look {
+        // what later submits compare their lists' closes with
+        LOOK_BEGAN_US.store(look_began, Ordering::Release);
+        LOOK_FRAME.store(look_frame, Ordering::Release);
+    }
+    super::prof::add(super::prof::Kind::SubmitWatch, watch_t0.elapsed());
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)
@@ -996,6 +1090,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     // the title's own memory: what the CPU wrote goes to its video memory first
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         DIRTY_BUF.with(|dcell| {
+            let _prof = super::prof::span(super::prof::Kind::SubmitSparse);
             let dirty = dcell.borrow();
             super::sparse::before_execute(q, &dirty, page as usize);
             super::vram::before_execute(q);
@@ -1072,7 +1167,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
     });
     seed_stream_recheck(&todo, &ranges, recheck_frame);
     let uploaded = !todo.is_empty();
+    let upload_prof = super::prof::span(super::prof::Kind::SubmitTextures);
     upload_all(todo, ID3D12CommandQueue::from_raw_borrowed(&queue));
+    drop(upload_prof);
     // Ensure the submitting queue waits for any `vram::map_levels` tile mappings queued inside
     // `upload_all`, even if an upload batch fell back to the upload queue or exited early.
     if uploaded {
@@ -1205,9 +1302,48 @@ unsafe fn changed_pages_since_last_upload(res: usize, src: usize, size: usize, d
     changed_pages_with(res, src, size, dirty_pages, page_size, |at, len| title_bytes(at, len))
 }
 
-/// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
-/// 8-byte words: gigabytes a second; not for anything adversarial).
-fn content_hash(b: &[u8]) -> u64 {
+#[inline]
+fn has_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn is_zero_avx2(b: &[u8]) -> bool {
+    use std::arch::x86_64::{_mm256_loadu_si256, _mm256_or_si256, _mm256_testz_si256, __m256i};
+    let mut ptr = b.as_ptr();
+    let mut rem = b.len();
+    while rem >= 128 {
+        let p = ptr as *const __m256i;
+        let a = _mm256_or_si256(_mm256_loadu_si256(p), _mm256_loadu_si256(p.add(1)));
+        let c = _mm256_or_si256(_mm256_loadu_si256(p.add(2)), _mm256_loadu_si256(p.add(3)));
+        let any = _mm256_or_si256(a, c);
+        if _mm256_testz_si256(any, any) == 0 {
+            return false;
+        }
+        ptr = ptr.add(128);
+        rem -= 128;
+    }
+    while rem >= 32 {
+        let v = _mm256_loadu_si256(ptr as *const __m256i);
+        if _mm256_testz_si256(v, v) == 0 {
+            return false;
+        }
+        ptr = ptr.add(32);
+        rem -= 32;
+    }
+    std::slice::from_raw_parts(ptr, rem).iter().all(|&x| x == 0)
+}
+
+fn content_hash_scalar(b: &[u8]) -> u64 {
     const K: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut h = [K, K.rotate_left(17), K.rotate_left(31), K.rotate_left(47)];
     let mut chunks = b.chunks_exact(32);
@@ -1222,6 +1358,21 @@ fn content_hash(b: &[u8]) -> u64 {
         tail = (tail ^ ((x as u64) << (8 * (k % 8)))).wrapping_mul(K).rotate_left(23);
     }
     h.iter().fold(tail, |a, &l| (a ^ l).wrapping_mul(K).rotate_left(27))
+}
+
+fn zero_page_hash_4k() -> u64 {
+    static H: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *H.get_or_init(|| content_hash_scalar(&[0u8; 4096]))
+}
+
+/// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
+/// 8-byte words: gigabytes a second; AVX2 fast-zero shortcut on 4 KiB pages).
+fn content_hash(b: &[u8]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if b.len() == 4096 && has_avx2() && unsafe { is_zero_avx2(b) } {
+        return zero_page_hash_4k();
+    }
+    content_hash_scalar(b)
 }
 
 /// Frame milestones (relative to last upload or detected content change) at which unwatched
@@ -1543,6 +1694,7 @@ unsafe fn submit_on_title_queue(dev: &ID3D12Device, queue: &ID3D12CommandQueue, 
         drop(f);
         return Err(e.to_string());
     }
+    super::flight::signaled("texture uploads", key, &q.fence, q.value);
     q.bytes = q.bytes.saturating_add(f.bytes);
     let v = q.value;
     q.in_flight.push_back((v, f));
@@ -2119,6 +2271,18 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_hash_avx2_zero_fast_path_matches_scalar() {
+        let mut page = vec![0u8; 4096];
+        assert_eq!(content_hash(&page), content_hash_scalar(&page));
+        for &off in &[0usize, 31, 32, 127, 128, 2047, 4095] {
+            page[off] = 1;
+            assert_eq!(content_hash(&page), content_hash_scalar(&page), "mismatch at offset {off}");
+            page[off] = 0;
+        }
+        assert_eq!(content_hash(&page), content_hash_scalar(&page));
+    }
 
     /// A texture is left out only when its memory hashes as at its own last upload, and a
     /// texture that was forgotten (released, or its address registered again) is uploaded again.
@@ -2928,6 +3092,90 @@ mod tests {
         let (_, mut unmap_unaligned) = tbl.insert(32, entry(0x31_0000, &tex_64k, true, true));
         unmap_unaligned.sort_unstable();
         assert_eq!(unmap_unaligned, vec![30, 31]);
+    }
+
+    /// Real GPU: render targets at two addresses of one physical page (mapped at the second after
+    /// the first, as a retail game aliases its targets) share one page of video memory, as on the
+    /// console; a target on another physical page gets its own.
+    #[test]
+    fn render_targets_on_one_physical_page_share_its_video_memory() {
+        // (a test that panicked holding these locks does not fail this one too)
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::hle::kernelx;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const NAME: &str = "render_targets_on_one_physical_page_share_its_video_memory";
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return println!("SKIPPED {NAME}: no adapter") };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return println!("SKIPPED {NAME}: software adapter");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev else { return println!("SKIPPED {NAME}: no D3D12 device") };
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err()
+                || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0
+            {
+                return println!("SKIPPED {NAME}: tiled tier < 2");
+            }
+            // (`vram::place` keeps no render target on pages below resource heap tier 2)
+            if opts.ResourceHeapTier.0 < 2 {
+                return println!("SKIPPED {NAME}: resource heap tier < 2");
+            }
+            if crate::gpu::uma::get().is_none() {
+                return println!("SKIPPED {NAME}: no UMA");
+            }
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            // a 128x128 R8G8B8A8 render target: one 64 KiB page on the console and on the PC
+            let mut rt = console_desc(3, 128, 128, 1, 1, 28, 0x109);
+            rt[0x30..0x34].copy_from_slice(&1u32.to_le_bytes());
+            let place = |va: usize| -> ID3D12Resource {
+                let mut p = std::ptr::null_mut();
+                let hr = super::super::device_x::create_placed_resource_x(dev.as_raw(), va as u64, rt.as_ptr(), D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32, std::ptr::null(), riid, &mut p);
+                assert!(hr >= 0 && !p.is_null(), "CreatePlacedResourceX at {va:#x}: {hr:#x}");
+                assert!(super::super::vram::is_placed_texture(p as usize), "expected a vram::Pages target at {va:#x}");
+                ID3D12Resource::from_raw(p)
+            };
+            let dev_pages = || super::super::vram::page_bytes_for(dev.as_raw() as usize).0;
+            let lost = || super::super::vram::tiles_unaccounted_for(dev.as_raw() as usize);
+            let space = VirtualAlloc(std::ptr::null(), 4 << 20, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(space, 0);
+            let (a, b, c, d) = (space, space + (1 << 20), space + (2 << 20), space + (3 << 20));
+            let (mut n, mut pages) = (3usize, [0usize; 3]);
+            assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let (before, lost_before) = (dev_pages(), lost());
+            assert_eq!(kernelx::MapTitlePhysicalPages(a as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, a);
+            let first = place(a);
+            // the same page at a second address: the console's alias of `a`
+            assert_eq!(kernelx::MapTitlePhysicalPages(b as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, b);
+            let second = place(b);
+            let shared = dev_pages() - before;
+            // another physical page: video memory of its own
+            assert_eq!(kernelx::MapTitlePhysicalPages(c as *mut c_void, 1, 0, 4, pages.as_mut_ptr().add(1)) as usize, c);
+            let third = place(c);
+            let all = dev_pages() - before;
+            // a target at `d` with no page mapped (keyed by its address), then a page mapped there
+            // and a second target: its page is keyed by the physical page, which has none yet
+            let fourth = place(d);
+            assert_eq!(kernelx::MapTitlePhysicalPages(d as *mut c_void, 1, 0, 4, pages.as_mut_ptr().add(2)) as usize, d);
+            let fifth = place(d);
+            let lost_after = lost();
+            drop((first, second, third, fourth, fifth));
+            let mut none = [0usize; 1];
+            kernelx::MapTitlePhysicalPages(b as *mut c_void, 1, 0, 4, none.as_mut_ptr());
+            kernelx::MapTitlePhysicalPages(c as *mut c_void, 1, 0, 4, none.as_mut_ptr());
+            kernelx::MapTitlePhysicalPages(d as *mut c_void, 1, 0, 4, none.as_mut_ptr());
+            kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr());
+            VirtualFree(space as *mut c_void, 0, MEM_RELEASE);
+            assert_eq!(shared, 0x1_0000, "two targets on one physical page: one page of video memory");
+            assert_eq!(all, 0x2_0000, "a target on another physical page: a page of its own");
+            assert_eq!(lost_after, lost_before, "every pool tile taken is a page's");
+        }
     }
 
     /// Real GPU (#248): placed title textures share `vram::Pages` so streaming unreleased

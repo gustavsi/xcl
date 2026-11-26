@@ -104,7 +104,7 @@ struct Chain {
     builder: Arc<PipelineBuilder>,
     tail: Vec<ID3D12PipelineState>,
     words: u32,
-    whole_code: Vec<u8>,
+    whole_code: Arc<Vec<u8>>,
     whole: OnceLock<Option<ID3D12PipelineState>>,
     whole_started: AtomicBool,
     /// after a whole build that ran out of memory: when it may be tried, once more
@@ -161,8 +161,19 @@ impl Chain {
         }
     }
 
+    /// After a whole build that ran out of memory, before its retry. Never waits: `whole` holds
+    /// `retry_at` for the whole driver compile (tens of seconds for the biggest programs), and a
+    /// title thread asking here (an allocator reset dropping a recording, a dispatch) stood that
+    /// long – a retail title's own GPU watchdog then ended it (`mov [0], 0x4d8bd421`). A build
+    /// going on is no cooldown: `start_whole_async` sees it by `whole_started` or starts the
+    /// async one, which waits for it on a worker.
     fn whole_in_cooldown(&self) -> bool {
-        self.retry_at.lock().unwrap().is_some_and(|t| std::time::Instant::now() < t)
+        let in_cooldown = |at: &Option<std::time::Instant>| at.is_some_and(|t| std::time::Instant::now() < t);
+        match self.retry_at.try_lock() {
+            Ok(g) => in_cooldown(&g),
+            Err(std::sync::TryLockError::WouldBlock) => false,
+            Err(std::sync::TryLockError::Poisoned(p)) => in_cooldown(&p.into_inner()),
+        }
     }
 
     fn start_whole_async(self: &Arc<Self>) {
@@ -286,7 +297,7 @@ unsafe fn signature_for(dev: &ID3D12Device, samplers: &[pso::StaticSampler]) -> 
 }
 
 pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
-    iid: *const GUID, result: *mut *mut c_void, record: u64, whole: &[u8], samplers: &[pso::StaticSampler],
+    iid: *const GUID, result: *mut *mut c_void, record: u64, whole: Arc<Vec<u8>>, samplers: &[pso::StaticSampler],
     plan: Arc<DispatchChain>) -> Option<usize> {
     if result.is_null() || iid.is_null() || plan.pieces.len() < 2 { return None; }
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
@@ -313,7 +324,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
         builder,
         tail: pieces.collect(),
         words: plan.dwords_per_group,
-        whole_code: whole.to_vec(),
+        whole_code: whole,
         whole: OnceLock::new(),
         whole_started: AtomicBool::new(false),
         retry_at: Mutex::new(None),
@@ -324,7 +335,11 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
-    CHAINS.lock().unwrap().insert(*result as usize, chain);
+    // a chain this one replaces (the same address made again) is dropped after the lock: its
+    // pipelines' release goes back into this module, which takes `CHAINS` (a self-deadlock that
+    // held a retail title's thread for good)
+    let replaced = CHAINS.lock().unwrap().insert(*result as usize, chain);
+    drop(replaced);
     HAS_CHAINS.store(true, Ordering::Release);
     Some(rs)
 }
@@ -1117,9 +1132,10 @@ mod tests {
         let plan_a = Arc::new(super::DispatchChain { pieces: vec![shared.clone(), tail_a.clone()], dwords_per_group: 4 });
         let plan_b = Arc::new(super::DispatchChain { pieces: vec![shared.clone(), tail_b.clone()], dwords_per_group: 4 });
 
+        let whole = Arc::new(whole);
         unsafe {
             let mut raw_a: *mut c_void = std::ptr::null_mut();
-            let rs_a = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_a, 1, &whole, &[], plan_a.clone()).expect("build Program A");
+            let rs_a = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_a, 1, whole.clone(), &[], plan_a.clone()).expect("build Program A");
             cleanup.psos.push(ID3D12PipelineState::from_raw(raw_a));
             cleanup.blob_keys.push(super::super::compute_blob_key(&shared, rs_a, 0));
             cleanup.blob_keys.push(super::super::compute_blob_key(&tail_a, rs_a, 0));
@@ -1137,7 +1153,7 @@ mod tests {
 
             let plib_hits_before_b = super::PLIB_HITS.load(Ordering::Relaxed);
             let mut raw_b: *mut c_void = std::ptr::null_mut();
-            let rs_b = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_b, 2, &whole, &[], plan_b).expect("build Program B");
+            let rs_b = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_b, 2, whole.clone(), &[], plan_b).expect("build Program B");
             cleanup.psos.push(ID3D12PipelineState::from_raw(raw_b));
             cleanup.blob_keys.push(super::super::compute_blob_key(&tail_b, rs_b, 0));
             let b_calls = std::mem::take(&mut *SPY_CALLS.lock().unwrap());
@@ -1158,7 +1174,7 @@ mod tests {
             drop(pso_a);
             let plib_hits_before_a2 = super::PLIB_HITS.load(Ordering::Relaxed);
             let mut raw_a2: *mut c_void = std::ptr::null_mut();
-            let rs_a2 = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_a2, 3, &whole, &[], plan_a).expect("rebuild Program A");
+            let rs_a2 = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_a2, 3, whole.clone(), &[], plan_a).expect("rebuild Program A");
             cleanup.psos.push(ID3D12PipelineState::from_raw(raw_a2));
             let a2_calls = std::mem::take(&mut *SPY_CALLS.lock().unwrap());
             assert_eq!(rs_a2, rs_a);
@@ -1205,7 +1221,7 @@ mod tests {
                 builder,
                 tail: Vec::new(),
                 words: 4,
-                whole_code: vec![0; 16],
+                whole_code: Arc::new(vec![0; 16]),
                 whole: OnceLock::new(),
                 whole_started: AtomicBool::new(false),
                 retry_at: Mutex::new(None),
@@ -1249,7 +1265,7 @@ mod tests {
                 builder,
                 tail: Vec::new(),
                 words: 4,
-                whole_code: vec![0; 16],
+                whole_code: Arc::new(vec![0; 16]),
                 whole: OnceLock::new(),
                 whole_started: AtomicBool::new(false),
                 retry_at: Mutex::new(None),

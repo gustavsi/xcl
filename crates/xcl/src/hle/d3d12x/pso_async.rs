@@ -65,6 +65,8 @@ struct Pending {
     /// tracks whether this entry currently contributes to `WANTED_ACTIVE_COUNT`
     wanted_state: AtomicU8,
     demand: Mutex<Demand>,
+    /// what its first use tells besides `used::note` (`on_first_use`)
+    on_use: Mutex<Option<OnUse>>,
 }
 
 impl Drop for Pending {
@@ -176,6 +178,10 @@ impl Pending {
     fn note_use(&self) {
         if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
+            let on_use = self.on_use.lock().unwrap().take();
+            if let Some(f) = on_use {
+                f();
+            }
         }
     }
 }
@@ -488,11 +494,15 @@ fn mem_throttle_enabled() -> bool {
     *ON.get_or_init(|| !cfg!(test) && !std::env::var("XCL_PSO_MEM_THROTTLE").is_ok_and(|v| v.trim() == "0"))
 }
 
+/// The system's free commit: what a driver compile can still allocate. (Free physical memory is
+/// not it: a retail title's world entry dropped it to 1.3 GB for a few seconds with 12 GB of
+/// commit free – the pages go to the page file – and the throttle on it held every pipeline
+/// worker idle while the title waited 14 s for a compute pipeline.)
 fn avail_commit_bytes() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPhys.min(m.ullAvailPageFile))
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPageFile)
 }
 
 /// Maximum concurrent top-level PSO worker builds allowed for the current available RAM/commit:
@@ -676,6 +686,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, flag
         waited_frame: AtomicU64::new(UNWAITED),
         wanted_state: AtomicU8::new(WANTED_NONE),
         demand: Default::default(),
+        on_use: Default::default(),
     });
     PENDING.write().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -690,6 +701,30 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, flag
             q.cv.notify_one();
         }
     }
+}
+
+/// Run on the thread of a lazy pipeline's first use, once (it is to hand work to another).
+pub type OnUse = Box<dyn FnOnce() + Send>;
+
+/// What the first use of lazy pipeline `standin` tells besides `used::note`: a graphics one's
+/// description for the next run's preparation (`gfx_records::note`). Told before the title has
+/// the stand-in.
+pub(super) fn on_first_use(standin: usize, f: OnUse) {
+    if let Some(p) = entry(standin) {
+        *p.on_use.lock().unwrap() = Some(f);
+    }
+}
+
+/// The shaders of a pipeline's set, told when the set's key is made (`real::OwnedDesc`).
+pub(crate) fn shaders_of(key: u64, shaders: Vec<u64>) {
+    used::parts(key, shaders);
+}
+
+/// The shaders of the pipelines earlier runs used, each by its own key (`used-shaders.txt`
+/// beside the DXIL cache): what a title's shader preparation translates. Empty before a run
+/// with this list has used a pipeline.
+pub fn earlier_used_shaders() -> std::collections::HashSet<u64> {
+    used::parse(&std::fs::read_to_string(crate::gpu::recomp::dxc::cache_dir().join("used-shaders.txt")).unwrap_or_default())
 }
 
 /// The keys of the pipelines earlier runs used (`used-pipelines.txt` beside the DXIL cache):
@@ -1030,6 +1065,10 @@ mod used {
     struct Used {
         earlier: RwLock<HashSet<u64>>,
         now: Journal,
+        /// the shaders of each set made in this run, by the set's key; the shaders of the sets
+        /// used so far and `used-shaders.txt`, where they are kept for the next run
+        parts: Mutex<std::collections::HashMap<u64, Vec<u64>>>,
+        shaders: Journal,
     }
 
     /// The keys in a `used-pipelines.txt` (lines that are not a hexadecimal key are passed over).
@@ -1052,11 +1091,14 @@ mod used {
         if !earlier.is_empty() {
             crate::xlog_info!("D3D12.X: the pipelines of {} shader sets an earlier run used are built ahead of their first use", earlier.len());
         }
+        let shaders_path = path.with_file_name("used-shaders.txt");
+        let earlier_shaders = parse(&std::fs::read_to_string(&shaders_path).unwrap_or_default());
         let now = Journal::with_sink(earlier.clone(), Sink::LazyFile(path, None), coalesce);
+        let shaders = Journal::with_sink(earlier_shaders, Sink::LazyFile(shaders_path, None), coalesce);
         unsafe {
             atexit(on_process_exit);
         }
-        Used { earlier: RwLock::new(earlier), now }
+        Used { earlier: RwLock::new(earlier), now, parts: Default::default(), shaders }
     }
 
     fn get() -> &'static Used {
@@ -1067,7 +1109,12 @@ mod used {
                 if let Some(p) = std::env::var_os("XCL_TEST_USED_STATIC_PATH") {
                     return init_from_path(PathBuf::from(p), Duration::from_secs(60));
                 }
-                return Used { earlier: RwLock::new(HashSet::new()), now: Journal::in_memory(HashSet::new()) };
+                return Used {
+                    earlier: RwLock::new(HashSet::new()),
+                    now: Journal::in_memory(HashSet::new()),
+                    parts: Default::default(),
+                    shaders: Journal::in_memory(HashSet::new()),
+                };
             }
             init_from_path(crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt"), COALESCE_WINDOW)
         })
@@ -1076,18 +1123,21 @@ mod used {
     pub fn flush() {
         if let Some(u) = U.get() {
             u.now.flush();
+            u.shaders.flush();
         }
     }
 
     pub fn shutdown() {
         if let Some(u) = U.get() {
             u.now.shutdown();
+            u.shaders.shutdown();
         }
     }
 
     pub fn flush_bounded(timeout: Duration) {
         if let Some(u) = U.get() {
             u.now.flush_bounded(timeout);
+            u.shaders.flush_bounded(timeout);
         }
     }
 
@@ -1098,7 +1148,29 @@ mod used {
 
     /// A pipeline of these shaders is used now: kept for the next run.
     pub fn note(key: u64) {
+        if key == 0 {
+            return;
+        }
         get().now.note(key);
+        // its shaders, each once (also those of a set an earlier run used: the list of
+        // shaders is younger than the list of sets)
+        let parts = get().parts.lock().unwrap().get(&key).cloned().unwrap_or_default();
+        for part in parts {
+            get().shaders.note(part);
+        }
+    }
+
+    /// The shaders of the set `key`, each by its own key (`real::shader_key`).
+    pub fn parts(key: u64, shaders: Vec<u64>) {
+        if key != 0 {
+            get().parts.lock().unwrap().entry(key).or_insert(shaders);
+        }
+    }
+
+    /// (tests) This run used the shader `key`.
+    #[cfg(test)]
+    pub fn shader_noted(key: u64) -> bool {
+        get().shaders.noted(key)
     }
 
     /// (tests) This run used a pipeline of these shaders.
@@ -1211,6 +1283,20 @@ fn preload() -> Option<&'static Preload> {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+
+    /// The shaders of a set are kept when a pipeline of the set is used, each once, and not
+    /// before: a set that is only made keeps nothing.
+    #[test]
+    fn the_shaders_of_a_used_set_are_kept_for_the_next_run() {
+        let (set, other) = (0x5e70_0000_0000_0001u64, 0x5e70_0000_0000_0003u64);
+        let (vs, ps, cs) = (0x5e70_0000_0000_0011u64, 0x5e70_0000_0000_0013u64, 0x5e70_0000_0000_0015u64);
+        shaders_of(set, vec![vs, ps]);
+        shaders_of(other, vec![cs]);
+        assert!(!used::shader_noted(vs) && !used::shader_noted(ps), "made, not used yet");
+        used::note(set);
+        assert!(used::shader_noted(vs) && used::shader_noted(ps), "the shaders of the used set");
+        assert!(!used::shader_noted(cs), "the other set was not used");
+    }
 
     /// A PC call that has kept one of the title's threads for long holds the title, a short one
     /// does not, and the hold ends with the call.
@@ -1684,6 +1770,25 @@ mod used_tests {
         released(unknown);
     }
 
+    /// What a pipeline's first use tells (a graphics one's description: `gfx_records`) is told
+    /// once, at that use, not when it is made or built.
+    #[test]
+    fn a_first_use_is_told_once() {
+        let (standin, key) = (0x7E57_7011usize, 0x5EED_0011u64);
+        let told = Arc::new(AtomicUsize::new(0));
+        submit_lazy(standin, true, Box::new(|| 0x4331), key);
+        let t = told.clone();
+        on_first_use(standin, Box::new(move || { t.fetch_add(1, Ordering::SeqCst); }));
+        assert_eq!(told.load(Ordering::SeqCst), 0, "not at its making");
+        assert_eq!(resolve_wait(standin), 0x4331);
+        assert_eq!(told.load(Ordering::SeqCst), 1);
+        assert_eq!(resolve(standin), 0x4331);
+        assert_eq!(resolve_wait(standin), 0x4331);
+        assert_eq!(told.load(Ordering::SeqCst), 1, "once");
+        on_first_use(0x7E57_7012, Box::new(|| unreachable!("no such pipeline")));
+        released(standin);
+    }
+
     static WORKER_SATURATION_LOCK: Mutex<()> = Mutex::new(());
 
     /// A queued normal worker job whose stand-in was released before a worker starts it is
@@ -2042,6 +2147,7 @@ pub fn submit_gated(standin: usize, driver: usize) {
         waited_frame: AtomicU64::new(UNWAITED),
         wanted_state: AtomicU8::new(WANTED_DONE),
         demand: Default::default(),
+        on_use: Default::default(),
     });
     PENDING.write().unwrap().get_or_insert_with(HashMap::new).insert(standin, p);
 }
@@ -2110,6 +2216,7 @@ pub fn wait_for_submit(pso: usize) {
     }
     p.note_use();
     let _held = Held::new();
+    let _prof = super::prof::span(super::prof::Kind::ComputePipelineWait);
     if !p.sent.swap(true, Ordering::AcqRel) {
         enqueue(p.clone());
     }
@@ -2252,6 +2359,7 @@ fn resolve_wait_in(
     }
     let Some(fcap) = frame_cap else {
         let _held = Held::new();
+        let _prof = super::prof::span(if p.compute { super::prof::Kind::ComputePipelineWait } else { super::prof::Kind::GraphicsPipelineWait });
         if let Some(b) = budget {
             return resolve_within(p, pso, b);
         }
@@ -2283,6 +2391,7 @@ fn resolve_wait_in(
         _ => (rem, false),
     };
     let _held = Held::new();
+    let _prof = super::prof::span(if p.compute { super::prof::Kind::ComputePipelineWait } else { super::prof::Kind::GraphicsPipelineWait });
     let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), wait_for, |d| !*d).unwrap();
     let finished = *done;
     drop(done);
@@ -2675,6 +2784,7 @@ mod pso_queue_tests {
             waited_frame: AtomicU64::new(UNWAITED),
             wanted_state: AtomicU8::new(WANTED_NONE),
             demand: Mutex::new(Demand { wanted, by_submit: false, preload_thread: 0 }),
+            on_use: Default::default(),
         })
     }
 
@@ -2697,6 +2807,7 @@ mod pso_queue_tests {
             waited_frame: AtomicU64::new(UNWAITED),
             wanted_state: AtomicU8::new(WANTED_NONE),
             demand: Mutex::new(Demand { wanted, by_submit: false, preload_thread: 0 }),
+            on_use: Default::default(),
         })
     }
 

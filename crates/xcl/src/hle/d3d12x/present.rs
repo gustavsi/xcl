@@ -52,6 +52,7 @@ static PRESENTX_LOCK: Mutex<()> = Mutex::new(());
 /// command queue #30 PresentX(planeCount, planes, parameters): plane 0's first resource is
 /// the frame; S_OK always (a console present does not fail for the title).
 pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
+    let _prof = super::prof::span(super::prof::Kind::Present);
     if plane_count == 0 || planes.is_null() || !crate::gpu::shader::readable(planes as usize, 0x18) {
         return 0;
     }
@@ -375,7 +376,10 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
 // window
 // ---------------------------------------------------------------------------------------
 
+pub(crate) mod preparation;
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if let Some(result) = preparation::on_message(hwnd, msg, wp) { return result; }
     // keyboard and mouse as the gamepad: raw mouse input, the cursor held in the window
     if crate::hle::kbm::on_message(hwnd.0, msg, wp.0, lp.0) {
         return LRESULT(0);
@@ -518,10 +522,10 @@ fn window_thread() {
             crate::xlog_error!("could not create the XCL window");
             return;
         };
-        HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
         crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
-        crate::hle::kbm::attach(hwnd.0);
+        if !preparation::active() { crate::hle::kbm::attach(hwnd.0); }
         SetTimer(Some(hwnd), COMPILE_TIMER, 500, None);
+        HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -1036,6 +1040,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
             p.h = h;
             p.fmt = fmt;
             crate::xlog_info!("present: swap chain {w}x{h} {:?} – the game image will appear in the XCL window", fmt);
+            crate::xlog_info!("present: swap chain window {:#x}", hwnd.0 as usize);
             p.sc.is_some()
         }
         Err(e) => {

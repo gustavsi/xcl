@@ -465,7 +465,10 @@ list_forward!(cl_3 = 3, cl_4 = 4, cl_5 = 5, cl_6 = 6, cl_7 = 7, cl_8 = 8);
 
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
     match close(this) {
-        Ok(_) => S_OK,
+        Ok(_) => {
+            super::title_textures::note_list_closed(this);
+            S_OK
+        }
         Err(e) => {
             crate::xlog_error!("console list: Close – {e}");
             crate::util::E_FAIL

@@ -357,6 +357,9 @@ fn run_worker(device: ID3D12Device, vendor_id: u32) {
             state.queue.ExecuteCommandLists(&[Some(state.slots[slot_idx].cmd_list.clone())]);
             state.queue.Signal(&state.fence, next_val).is_ok()
         });
+        if submitted {
+            super::flight::signaled("gpu-awake", windows::core::Interface::as_raw(&state.queue) as usize, &state.fence, next_val);
+        }
         if !submitted {
             break;
         }

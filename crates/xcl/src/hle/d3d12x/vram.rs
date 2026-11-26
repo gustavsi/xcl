@@ -411,6 +411,8 @@ struct Target {
     /// its levels get their pages one by one (`map_levels`); None: all of it has pages
     levels: Option<Levels>,
     recycle: Option<ReservedKey>,
+    /// placed as GPU-owned: its pages are keyed by the physical page under them (`page_key`)
+    gpu_owned: bool,
 }
 
 /// An owned page of placed textures in a graphics reservation: mapped only while the title
@@ -1322,6 +1324,7 @@ impl Pages {
             let coord = D3D12_TILED_RESOURCE_COORDINATE { Subresource: sub, ..Default::default() };
             let region = D3D12_TILE_REGION_SIZE { NumTiles: num_tiles, UseBox: false.into(), ..Default::default() };
             let _timer = step(Step::Map);
+            let flight_t = std::time::Instant::now();
             self.queue.UpdateTileMappings(
                 res,
                 1,
@@ -1334,6 +1337,7 @@ impl Pages {
                 Some(self.scratch_counts.as_ptr()),
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
+            super::flight::tile_map("vram", windows::core::Interface::as_raw(&self.queue) as usize, (num_tiles) as u64, flight_t.elapsed());
         }
         self.dirty_signal = true;
     }
@@ -1347,6 +1351,7 @@ impl Pages {
         let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
         let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
         let flag = D3D12_TILE_RANGE_FLAG_NULL;
+        let flight_t = std::time::Instant::now();
         self.queue.UpdateTileMappings(
             res,
             1,
@@ -1359,6 +1364,7 @@ impl Pages {
             Some(&total),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
+        super::flight::tile_map("vram", windows::core::Interface::as_raw(&self.queue) as usize, (total) as u64, flight_t.elapsed());
         self.dirty_signal = true;
     }
 
@@ -1458,6 +1464,7 @@ impl Pages {
         if ok {
             self.value += 1;
             let _ = self.queue.Signal(&self.fence, self.value);
+            super::flight::signaled("vram pages", windows::core::Interface::as_raw(&self.queue) as usize, &self.fence, self.value);
             self.dirty_signal = false;
             slot.fence_val = self.value;
         }
@@ -1469,6 +1476,7 @@ impl Pages {
             let _timer = step(Step::Signal);
             self.value += 1;
             let _ = self.queue.Signal(&self.fence, self.value);
+            super::flight::signaled("vram pages", windows::core::Interface::as_raw(&self.queue) as usize, &self.fence, self.value);
             self.dirty_signal = false;
         }
     }
@@ -1487,6 +1495,7 @@ impl Pages {
         let flags: Vec<D3D12_TILE_RANGE_FLAGS> = ranges.iter().map(|r| r.0).collect();
         let offsets: Vec<u32> = ranges.iter().map(|r| r.1).collect();
         let counts: Vec<u32> = ranges.iter().map(|r| r.2).collect();
+        let flight_t = std::time::Instant::now();
         self.queue.UpdateTileMappings(
             res,
             1,
@@ -1499,6 +1508,7 @@ impl Pages {
             Some(counts.as_ptr()),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
+        super::flight::tile_map("vram", windows::core::Interface::as_raw(&self.queue) as usize, (region.NumTiles) as u64, flight_t.elapsed());
         self.dirty_signal = true;
     }
 
@@ -1562,10 +1572,12 @@ impl Pages {
         }
     }
 
-    /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
+    /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue
+    /// (`phys[i]`: the title's physical page at owned page i, if any – see `page_key`).
     /// When `follow_key` is `Some`, a page in a graphics reservation the title has no memory at
     /// yet is left unmapped (tier 2: reads zero) and mapped when the title puts memory there
     /// (`apply_backing`); GPU-owned targets (`RT | DS | UAV`) pass `None` so every tile is backed.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn bind_with_follow(
         &mut self,
         dev: &ID3D12Device,
@@ -1574,13 +1586,14 @@ impl Pages {
         va: usize,
         console_bytes: Option<u64>,
         total: u32,
+        phys: &[Option<usize>],
     ) -> Option<(Vec<usize>, Vec<(usize, usize)>, Vec<usize>)> {
-        self.bind_range(dev, res, follow_key, va, console_bytes, total, 0, 0..total as usize)
+        self.bind_range(dev, res, follow_key, va, console_bytes, total, 0, 0..total as usize, phys)
     }
 
     #[cfg(test)]
     unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, key: usize, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>, Vec<usize>)> {
-        self.bind_with_follow(dev, res, Some(key), va, console_bytes, total)
+        self.bind_with_follow(dev, res, Some(key), va, console_bytes, total, &[])
     }
 
     /// `bind` for the tiles `range` of the resource's `total`, which start at subresource `sub`.
@@ -1595,6 +1608,7 @@ impl Pages {
         total: u32,
         sub: u32,
         range: std::ops::Range<usize>,
+        phys: &[Option<usize>],
     ) -> Option<(Vec<usize>, Vec<(usize, usize)>, Vec<usize>)> {
         #[cfg(test)]
         if FAIL_LEVEL_BIND_FOR_TEST.with(|failure| {
@@ -1614,7 +1628,7 @@ impl Pages {
 
         enum TilePlan {
             FollowSkip(usize),
-            Own { addr: usize, follow: bool },
+            Own { addr: usize, key: usize, follow: bool },
             Extra(usize, usize),
         }
 
@@ -1630,6 +1644,7 @@ impl Pages {
         for i in range.clone() {
             if i < own {
                 let a = first + i * PAGE;
+                let key = page_key(a, phys.get(i).copied().flatten());
                 let in_res = if check_res {
                     if res_bounds.is_none_or(|(lo, hi)| a < lo || a >= hi) {
                         res_bounds = crate::hle::kernelx::graphics_reservation_bounds(a);
@@ -1639,19 +1654,19 @@ impl Pages {
                     false
                 };
                 if in_res {
-                    let shared = self.pages.get(&a).is_some_and(|p| p.users > 0);
+                    let shared = self.pages.get(&key).is_some_and(|p| p.users > 0);
                     let already_mapped = self.follow.get(&a).is_some_and(|f| f.mapped);
                     if !(already_mapped || shared || title_backed_in(a, &mut backed_run)) {
                         plan.push(TilePlan::FollowSkip(a));
                         continue;
                     }
                 }
-                match self.pages.get(&a).map(|p| p.tile.0) {
+                match self.pages.get(&key).map(|p| p.tile.0) {
                     Some(h) if preferred.is_none() => preferred = Some(h),
                     Some(_) => {}
                     None => missing += 1,
                 }
-                plan.push(TilePlan::Own { addr: a, follow: in_res });
+                plan.push(TilePlan::Own { addr: a, key, follow: in_res });
             } else {
                 match self.extra_pages.get(&(va, i)).map(|p| p.tile.0) {
                     Some(h) if preferred.is_none() => preferred = Some(h),
@@ -1686,16 +1701,16 @@ impl Pages {
                     }
                     tiles.push(None);
                 }
-                TilePlan::Own { addr: a, follow } => {
+                TilePlan::Own { addr: a, key, follow } => {
                     if follow {
                         follows.push(a);
-                        if let Some(key) = follow_key {
+                        if let Some(fkey) = follow_key {
                             let f = self.follow.entry(a).or_insert(Follow { users: Vec::new(), mapped: false });
-                            f.users.push((key, i as u32));
+                            f.users.push((fkey, i as u32));
                             f.mapped = true;
                         }
                     }
-                    let t = match self.pages.get_mut(&a) {
+                    let t = match self.pages.get_mut(&key) {
                         Some(p) => {
                             p.users += 1;
                             p.idle_since = None;
@@ -1703,11 +1718,11 @@ impl Pages {
                         }
                         None => {
                             let t = fresh_iter.next().unwrap();
-                            self.pages.insert(a, Page { tile: t, users: 1, idle_since: None });
+                            self.pages.insert(key, Page { tile: t, users: 1, idle_since: None });
                             t
                         }
                     };
-                    used.push(a);
+                    used.push(key);
                     tiles.push(Some(t));
                 }
                 TilePlan::Extra(va, idx) => {
@@ -1861,6 +1876,7 @@ impl Pages {
                 let flags: Vec<D3D12_TILE_RANGE_FLAGS> = ranges.iter().map(|r| r.0).collect();
                 let offsets: Vec<u32> = ranges.iter().map(|r| r.1).collect();
                 let counts: Vec<u32> = ranges.iter().map(|r| r.2).collect();
+                let flight_t = std::time::Instant::now();
                 self.queue.UpdateTileMappings(
                     res,
                     1,
@@ -1873,6 +1889,7 @@ impl Pages {
                     Some(counts.as_ptr()),
                     D3D12_TILE_MAPPING_FLAG_NONE,
                 );
+                super::flight::tile_map("vram", windows::core::Interface::as_raw(&self.queue) as usize, (total) as u64, flight_t.elapsed());
             }
         }
         self.dirty_signal = true;
@@ -1963,6 +1980,30 @@ fn canonical_va(va: usize) -> usize {
     if mapped { va } else { src }
 }
 
+/// Keys of `Pages::pages` for the title's physical pages (title addresses never have bit 63).
+const PHYS_KEY: usize = 1 << 63;
+
+/// The key of the page of video memory for title page address `a`: the physical page mapped
+/// there (`phys`), else the address. A retail game maps one physical page under render targets
+/// at two addresses (aliasing, as on the console): keyed by address, each got video memory of
+/// its own (1.85 GB more in its first 40 s) and what the GPU wrote through one never showed in
+/// the other.
+fn page_key(a: usize, phys: Option<usize>) -> usize {
+    phys.map_or(a, |p| PHYS_KEY | p)
+}
+
+/// The physical pages under a GPU-owned texture's owned pages (`require_aligned`), asked before
+/// `PAGES` is taken; empty for others (keyed by address) and without the console size.
+fn physical_pages_under(va: usize, console_bytes: Option<u64>, require_aligned: bool) -> Vec<Option<usize>> {
+    if !require_aligned {
+        return Vec::new();
+    }
+    match console_bytes.and_then(|b| owned_pages(va, Some(b), usize::MAX)) {
+        Some((first, n)) if n > 0 => crate::hle::kernelx::physical_pages(first, n),
+        _ => Vec::new(),
+    }
+}
+
 /// A texture at `va` as a reserved resource on the title's shared 64 KiB pages
 /// (`console_bytes`: its size on the console; tiles past the owned page boundaries are shared by
 /// `(va, tile_index)` so repeated placements at the same address do not leak). None: it cannot be.
@@ -1989,6 +2030,7 @@ unsafe fn place_on_pages(
     if (require_aligned || console_bytes.is_none()) && va % PAGE != 0 {
         return None;
     }
+    let phys = physical_pages_under(va, console_bytes, require_aligned);
     // reserved textures have the PC's 64 KiB tiles
     let tiled = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..*desc };
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2106,10 +2148,10 @@ unsafe fn place_on_pages(
                 // nothing mapped yet: a level gets its pages with its first texels (`map_levels`)
                 LEVEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, mapping_gen: 0, used: Vec::new(), used_extra: Vec::new(), follows: Vec::new(), follow_backing, levels, recycle: recycle_key });
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, mapping_gen: 0, used: Vec::new(), used_extra: Vec::new(), follows: Vec::new(), follow_backing, levels, recycle: recycle_key, gpu_owned: require_aligned });
                 true
-            } else if let Some((used, used_extra, follows)) = pages.bind_with_follow(dev, res, follow_backing.then_some(raw as usize), va, console_bytes, total) {
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, mapping_gen: 0, used, used_extra, follows, follow_backing, levels: None, recycle: recycle_key });
+            } else if let Some((used, used_extra, follows)) = pages.bind_with_follow(dev, res, follow_backing.then_some(raw as usize), va, console_bytes, total, &phys) {
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, mapping_gen: 0, used, used_extra, follows, follow_backing, levels: None, recycle: recycle_key, gpu_owned: require_aligned });
                 true
             } else {
                 false
@@ -2185,21 +2227,29 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     }
     let Some(dev) = dev else { return false };
     let key = res.as_raw() as usize;
-    let mut g = PAGES.lock().unwrap();
-    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
-    let Some((va, console_bytes, total, mapped, follow_backing)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped, t.follow_backing)) else {
-        return false;
+    let target = |g: &mut std::sync::MutexGuard<'_, std::collections::BTreeMap<usize, Option<Pages>>>| {
+        let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return None };
+        pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped, t.follow_backing, t.gpu_owned))
     };
+    // (the physical pages are asked without `PAGES` held)
+    let Some((va, console_bytes, _, mapped, _, gpu_owned)) = target(&mut PAGES.lock().unwrap()) else { return false };
     if mapped {
         return true;
     }
+    let phys = physical_pages_under(va, console_bytes, gpu_owned);
+    let mut g = PAGES.lock().unwrap();
+    let Some((va, console_bytes, total, mapped, follow_backing, _)) = target(&mut g) else { return false };
+    if mapped {
+        return true;
+    }
+    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
     // (lazy levels: they get their pages again with their next texels)
     if let Some(t) = pages.targets.get_mut(&key).filter(|t| t.levels.is_some()) {
         t.mapped = true;
         t.mapping_gen = t.mapping_gen.wrapping_add(1);
         return true;
     }
-    let Some((used, used_extra, follows)) = pages.bind_with_follow(&dev, res, follow_backing.then_some(key), va, console_bytes, total) else {
+    let Some((used, used_extra, follows)) = pages.bind_with_follow(&dev, res, follow_backing.then_some(key), va, console_bytes, total, &phys) else {
         return false;
     };
     if let Some(t) = pages.targets.get_mut(&key) {
@@ -2475,6 +2525,9 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let mut do_reclaim = false;
     let mut need_unmap_work = false;
     let mut unmap_mark: Option<(ID3D12Fence, u64)> = None;
+    // the page mappings this queue waits for, waited on the CPU after the lock (as the sparse
+    // windows' are: `sparse::cpu_waited_for_mappings`)
+    let mut mapping_wait: Option<(ID3D12Fence, u64)> = None;
     {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
@@ -2488,8 +2541,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
             pages.flush_signal();
             let key = queue.as_raw() as usize;
             if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
-                let _ = queue.Wait(&pages.fence, pages.value);
-                super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, pages.value);
+                mapping_wait = Some((pages.fence.clone(), pages.value));
                 pages.waited.insert(key, pages.value);
             }
             let low_commit = commit_low();
@@ -2508,6 +2560,12 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
                 || pages.cool_probe.is_some()
                 || !pages.pool.cooling.is_empty()
                 || !pages.idle.is_empty();
+        }
+    }
+    if let Some((fence, value)) = mapping_wait {
+        if !super::sparse::cpu_waited_for_mappings(&fence, value, "texture page mappings") {
+            let _ = queue.Wait(&fence, value);
+            super::list_x::note_internal_wait(queue.as_raw() as usize, "texture page mappings", &fence, value);
         }
     }
     if need_unmap_work {
@@ -2622,6 +2680,14 @@ pub(super) fn tile_mappings_for(device: usize, resource: usize) -> Option<(Vec<(
     (used.len() + extra.len() == target.total as usize).then_some((used, extra))
 }
 
+/// Pool tiles of `device` that are neither free, cooling, nor any page's (taken and lost).
+#[cfg(test)]
+pub(super) fn tiles_unaccounted_for(device: usize) -> usize {
+    let g = PAGES.lock().unwrap();
+    let Some(Some(p)) = g.get(&device) else { return 0 };
+    (p.pools.len() * POOL_PAGES as usize).saturating_sub(p.pool.free_total + p.pool.cooling.len() + p.pages.len() + p.extra_pages.len())
+}
+
 /// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
 pub fn page_bytes() -> (usize, usize) {
     let (su, sp) = super::vram_small::bytes();
@@ -2722,7 +2788,7 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return false };
         let mut complete = true;
         for (k, sub, first, n) in todo {
-            let Some((used, used_extra, _)) = pages.bind_range(dev, res, None, va, console_bytes, total, sub, first as usize..(first + n) as usize) else {
+            let Some((used, used_extra, _)) = pages.bind_range(dev, res, None, va, console_bytes, total, sub, first as usize..(first + n) as usize, &[]) else {
                 complete = false;
                 continue;
             };
@@ -3889,7 +3955,7 @@ mod tests {
             assert!(total >= 1 && (total as usize) * PAGE <= span);
 
             let (used, extra, follows) = pages
-                .bind_with_follow(&dev, &res, None, va, Some(total as u64 * PAGE as u64), total)
+                .bind_with_follow(&dev, &res, None, va, Some(total as u64 * PAGE as u64), total, &[])
                 .expect("GPU-owned bind must map every tile even when title VA is uncommitted");
             assert_eq!(used.len() + extra.len(), total as usize);
             assert!(follows.is_empty(), "GPU-owned target must not register FollowSkip entries");

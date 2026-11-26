@@ -109,6 +109,9 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             modules::describe_address(addr)
         );
         crate::xlog_error!("{msg}");
+        // XCL's queues and the last GPU-side events (`d3d12x::flight`): a title that ends itself
+        // after its own GPU watchdog fired shows here which queue had stopped
+        crate::hle::d3d12x::flight::dump("crash");
         crate::report::write_final(Some(msg));
         crate::log::flush();
     }
@@ -682,7 +685,7 @@ pub fn dump_threads() {
                         ok
                     };
                     if got {
-                        let frames: Vec<String> = unwind(&mut c.0, 14).into_iter().map(modules::describe_address).collect();
+                        let frames: Vec<String> = unwind(&mut c.0, 40).into_iter().map(modules::describe_address).collect();
                         lines.push(format!("thread {} '{}': {}", te.th32ThreadID, thread_name(h), frames.join(" < ")));
                     }
                     CloseHandle(h);

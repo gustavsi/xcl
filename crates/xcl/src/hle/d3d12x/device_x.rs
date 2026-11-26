@@ -1095,6 +1095,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     // the PC's reserved resource and tile mappings for it can take long where the console's
     // placement takes no time (`pso_async::title_held`)
     let _in_pc = super::pso_async::pc_call();
+    let _prof = super::prof::span(super::prof::Kind::Placement);
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let texture = u32::from_le_bytes(x[0..4].try_into().unwrap()) != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
     let _total = texture.then(|| place_times::step(Step::Total));

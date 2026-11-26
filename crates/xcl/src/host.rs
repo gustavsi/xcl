@@ -8,6 +8,18 @@ use crate::config::Boot;
 
 pub static HOST_MODE: AtomicBool = AtomicBool::new(false);
 
+/// System-wide virtual commit `(used_mb, limit_mb)` via `GlobalMemoryStatusEx`.
+pub(crate) fn system_commit() -> (u64, u64) {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return (0, 0);
+    }
+    let used = m.ullTotalPageFile.saturating_sub(m.ullAvailPageFile);
+    (used >> 20, m.ullTotalPageFile >> 20)
+}
+
 pub fn host_main(boot_path: &Path) -> i32 {
     let boot: Boot = match std::fs::read_to_string(boot_path).map_err(|e| e.to_string()).and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string())) {
         Ok(b) => b,
@@ -36,6 +48,11 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
+    if let Err(e) = crate::hle::d3d12x::present::preparation::before_guest(&boot) {
+        crate::xlog_error!("Shader preparation: {e}");
+        eprintln!("xcl: {e}");
+        return 2;
+    }
     let _ = std::thread::Builder::new().name("xcl-split-counts".into()).spawn(|| loop {
         std::thread::sleep(std::time::Duration::from_secs(10));
         crate::hle::d3d12x::real::log_dispatch_chain_counts();
@@ -51,6 +68,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
             };
             let mut last = snap();
+            let mut prof_last = crate::hle::d3d12x::prof::totals();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 // a device removed while every title thread waits: nothing else would ask
@@ -62,8 +80,17 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let o = std::sync::atomic::Ordering::Relaxed;
                 if SEEN.swap(frames, o) != frames || frames < 100 {
                     IDLE.store(0, o);
-                } else if IDLE.fetch_add(1, o) == 2 {
-                    crate::hle::d3d12x::culprit::on_watchdog_release();
+                } else {
+                    let idle = IDLE.fetch_add(1, o);
+                    if idle == 2 {
+                        crate::hle::d3d12x::culprit::on_watchdog_release();
+                    }
+                    // `XCL_STALL_DUMP=1`: where every thread is, 8 s into a stall (3 stalls at most)
+                    static DUMPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if idle == 3 && std::env::var("XCL_STALL_DUMP").is_ok_and(|v| v.trim() == "1") && DUMPS.fetch_add(1, o) < 3 {
+                        crate::xlog_info!("no frame for 8 s: thread dump");
+                        crate::eh::dump_threads();
+                    }
                 }
                 let now = snap();
                 let d: Vec<u64> = now.iter().zip(last).map(|(a, b)| a - b).collect();
@@ -71,6 +98,12 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed",
                     d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
                 );
+                // where the title's threads waited in XCL meanwhile (`d3d12x::prof`)
+                let prof_now = crate::hle::d3d12x::prof::totals();
+                crate::xlog_info!("{}", crate::hle::d3d12x::prof::line(prof_last, prof_now, d[0], 2.0));
+                prof_last = prof_now;
+                // tile mappings, resources made and the video memory budget (`d3d12x::flight`)
+                crate::xlog_info!("{}", crate::hle::d3d12x::flight::line());
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let private = unsafe {
                     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
@@ -99,6 +132,14 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                // the same against DXGI's budget, by owner, with what XCL does not count (#2688)
+                crate::xlog_info!("{}", crate::hle::d3d12x::memory_report::snapshot().line());
+                crate::xlog_info!("memory: the title's committed resources alive (MB): {}", crate::hle::d3d12x::real::live_committed_line());
+                // and every 10 s where the rest is: the address space walked
+                static WALKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if WALKS.fetch_add(1, o) % 5 == 0 {
+                    crate::xlog_info!("{}", crate::hle::d3d12x::memory_report::walk_line());
+                }
                 last = now;
             }
         });

@@ -908,6 +908,14 @@ impl Lw {
         };
         let base = name.trim_start_matches("image_");
         if base == "bvh_intersect_ray" || base == "bvh64_intersect_ray" {
+            // `XCL_RT_GATE=miss`: no node is read, every ray misses
+            if super::kernel::rt_all_miss() {
+                let ones = self.c(u32::MAX);
+                for c in 0..4u64 {
+                    self.write32(&super::lower::Dst::V(vdata + c), ones);
+                }
+                return Ok(());
+            }
             let wide = base == "bvh64_intersect_ray";
             let r = |lw: &mut Lw, j: u64| lw.vreg(addr_reg(j));
             let node = r(self, 0);

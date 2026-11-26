@@ -619,6 +619,8 @@ mod tests {
                 rb_queue,
                 rb_fence,
                 rb_value: 0,
+                mapping_queued: std::sync::atomic::AtomicBool::new(false),
+                mapped_value: 0,
                 rb_done_fence,
                 rb_done_value: 0,
                 windows: vec![(window, reserved.expect("reserved buffer"))],

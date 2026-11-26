@@ -13,7 +13,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use super::cfg::{Cfg, Term};
 use super::container::Stage;
-use super::lower::{ComputeInit, Init, Lw, Partner, VAR_BUDGET, VAR_SCC, VAR_VGPR};
+use super::lower::{ComputeInit, Init, Lw, Partner, LOOP_BUDGET, VAR_BUDGET, VAR_BUDGET_OWNER, VAR_BUDGET_TOTAL, VAR_SCC, VAR_VGPR};
 use super::module::{Block, Pred, Value};
 use super::shader::{RawUav, Shader};
 use super::ssa::Ssa;
@@ -72,6 +72,55 @@ pub use super::module::split::DispatchChain;
 
 pub fn dispatch_piece_limit() -> usize {
     std::env::var("XCL_DIRECT_SPLIT_INSTRUCTIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(12_500)
+}
+
+/// `XCL_RT_GATE=miss`: every `image_bvh*_intersect_ray` misses (the four result dwords all ones,
+/// as for a null BVH). Ray-tracing programs then run and write what they write when no ray hits
+/// anything, instead of being held back (`XCL_RT_GATE=hold`) with their outputs never written:
+/// 707 of the 1 073 programs a retail title's hold leaves out write memory that later passes and
+/// the CPU read (screen-probe ray lists, ray-traced resolves, particle collisions). Traversal
+/// loops end at the root, so no BVH is read and none can keep the GPU busy.
+pub fn rt_all_miss() -> bool {
+    #[cfg(test)]
+    if let Some(on) = RT_ALL_MISS_FOR_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_RT_GATE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("miss")))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `rt_all_miss` for the translations of this test thread
+    pub(crate) static RT_ALL_MISS_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Loop iterations a lane of a ray-tracing program may run with `XCL_RT_GATE=miss` (all its
+/// loops together; `lower::LOOP_BUDGET` for every other program). With every ray missing their
+/// traversal ends at once, and what else loops in them runs a few dozen rounds; but the device
+/// hung (a TDR, 2 s into a retail title's world) the first time they all ran at 65 536 a lane.
+pub const RT_LOOP_BUDGET: u32 = 1 << 9;
+
+thread_local! {
+    /// The translation on this thread is of a ray-tracing program (`with_rt_program`).
+    static RT_PROGRAM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `f` with the translations it makes on this thread taken as of a ray-tracing program (`rt`).
+pub fn with_rt_program<R>(rt: bool, f: impl FnOnce() -> R) -> R {
+    let before = RT_PROGRAM.with(|c| c.replace(rt));
+    let r = f();
+    RT_PROGRAM.with(|c| c.set(before));
+    r
+}
+
+/// The loop budget a lane starts with in the program being translated.
+pub fn loop_budget() -> u32 {
+    if RT_PROGRAM.with(|c| c.get()) && rt_all_miss() {
+        RT_LOOP_BUDGET
+    } else {
+        super::lower::LOOP_BUDGET
+    }
 }
 
 /// `XCL_DIRECT_COMPACT`: `1` forces the compact form, `0` forbids it, unset leaves it to `compact::wanted`.
@@ -177,10 +226,19 @@ fn translate_entry_with(
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
+    // (a test's `RT_ALL_MISS_FOR_TEST`, and `with_rt_program`, go along to the translator's thread)
+    #[cfg(test)]
+    let rt_all_miss = RT_ALL_MISS_FOR_TEST.with(|c| c.get());
+    let rt_program = RT_PROGRAM.with(|c| c.get());
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, rodata))
+        .spawn(move || {
+            #[cfg(test)]
+            RT_ALL_MISS_FOR_TEST.with(|c| c.set(rt_all_miss));
+            RT_PROGRAM.with(|c| c.set(rt_program));
+            translate_on_this_thread(&code, o, entry, compact, nest, rodata)
+        })
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {
@@ -371,6 +429,7 @@ fn translate_on_this_thread(
             None => super::compact::emit(&mut lw, &cfg, p, h0, exit)?,
         }
     }
+    let regions = crate::gpu::recomp::budget_regions(&crate::gpu::recomp::loop_ranges(&cfg.insts));
     for &b in cfg.rpo.iter().filter(|_| plan.is_none()) {
         let h = head(&mut lw, b);
         lw.s.m.set_block(h);
@@ -386,8 +445,19 @@ fn translate_on_this_thread(
         }
         let end = if es_block { switch.unwrap() } else { exit };
         if cfg.headers.contains(&b) {
-            // a lane's loop iterations are capped (the recompiler's LOOP_GUARD)
-            let left = lw.rd(VAR_BUDGET);
+            // a lane's loop iterations are capped (the recompiler's LOOP_GUARD / loop_guard)
+            let region = crate::gpu::recomp::budget_region(&regions, cfg.blocks[b].pc);
+            let mut left = lw.rd(VAR_BUDGET);
+            if let Some(r) = region {
+                let own = lw.rd(VAR_BUDGET_OWNER);
+                let other = lw.cmpc(Pred::Ne, own, r);
+                left = lw.selc(other, LOOP_BUDGET * crate::gpu::recomp::LOOP_BUDGETS_PER_REGION, left);
+                let rv = lw.c(r);
+                lw.wr(VAR_BUDGET_OWNER, rv);
+                let total = lw.rd(VAR_BUDGET_TOTAL);
+                let spent = lw.cmpc(Pred::Eq, total, 0);
+                left = lw.selc(spent, 0, left);
+            }
             let none = lw.cmpc(Pred::Eq, left, 0);
             let cont = lw.block(Some(1));
             lw.cond_br(none, end, cont);
@@ -395,6 +465,11 @@ fn translate_on_this_thread(
             let one = lw.c(1);
             let l = lw.sub(left, one);
             lw.wr(VAR_BUDGET, l);
+            if region.is_some() {
+                let total = lw.rd(VAR_BUDGET_TOTAL);
+                let t = lw.sub(total, one);
+                lw.wr(VAR_BUDGET_TOTAL, t);
+            }
         }
         for &i in &cfg.blocks[b].insts {
             lw.reload = reloads.get(b, i);
