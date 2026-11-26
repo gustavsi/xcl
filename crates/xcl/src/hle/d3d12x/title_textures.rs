@@ -94,7 +94,17 @@ struct Table {
     /// Largest byte span currently in `shadowed` (bounds range queries)
     max_shadowed_size: usize,
     next_seq: u64,
+    /// Active textures indexed by the 1 MiB pieces of their source (`Entry::src`) they cover.
+    src_pieces: BTreeMap<usize, Vec<usize>>,
+    /// Active textures whose first/re-queued upload is pending (`Entry::pending`; may name retired ones).
+    pending_res: std::collections::BTreeSet<usize>,
+    /// Active textures whose source lies in the committed coherent UMA window (tracked separately
+    /// under Wine where the coherent window has no `MEM_WRITE_WATCH`).
+    committed_res: std::collections::BTreeSet<usize>,
 }
+
+/// 1 MiB piece shift for `Table::src_pieces`.
+const SRC_PIECE_SHIFT: usize = 20;
 
 impl Table {
     const fn new() -> Self {
@@ -105,7 +115,47 @@ impl Table {
             shadowed_by_va: BTreeMap::new(),
             max_shadowed_size: 0,
             next_seq: 0,
+            src_pieces: BTreeMap::new(),
+            pending_res: std::collections::BTreeSet::new(),
+            committed_res: std::collections::BTreeSet::new(),
         }
+    }
+
+    fn link_src(&mut self, res: usize, src: usize, size: usize) {
+        for p in (src >> SRC_PIECE_SHIFT)..=((src + size.max(1) - 1) >> SRC_PIECE_SHIFT) {
+            self.src_pieces.entry(p).or_default().push(res);
+        }
+        if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(src, size)) {
+            self.committed_res.insert(res);
+        }
+    }
+
+    fn unlink_src(&mut self, res: usize, src: usize, size: usize) {
+        for p in (src >> SRC_PIECE_SHIFT)..=((src + size.max(1) - 1) >> SRC_PIECE_SHIFT) {
+            if let Some(v) = self.src_pieces.get_mut(&p) {
+                v.retain(|&r| r != res);
+                if v.is_empty() {
+                    self.src_pieces.remove(&p);
+                }
+            }
+        }
+        self.committed_res.remove(&res);
+    }
+
+    /// The active textures whose source the sorted dirty pages `dirty` may touch.
+    fn touched_by(&self, dirty: &[usize]) -> std::collections::BTreeSet<usize> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut last = usize::MAX;
+        for &p in dirty {
+            let piece = p >> SRC_PIECE_SHIFT;
+            if piece != last {
+                last = piece;
+                if let Some(v) = self.src_pieces.get(&piece) {
+                    out.extend(v.iter().copied());
+                }
+            }
+        }
+        out
     }
 
     fn has_active_overlap(&self, va: usize, end: usize) -> bool {
@@ -153,6 +203,7 @@ impl Table {
         for (ova, ores, _) in self.active_overlaps(va, end) {
             self.by_va.remove(&(ova, ores));
             if let Some(old) = self.by_res.remove(&ores) {
+                self.unlink_src(ores, old.src, old.tex.size() as usize);
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -188,6 +239,7 @@ impl Table {
         let mut pending_delta = 0isize;
         let mut to_unmap = Vec::new();
         if let Some(old) = self.by_res.remove(&res) {
+            self.unlink_src(res, old.src, old.tex.size() as usize);
             self.by_va.remove(&(old.va, res));
             if old.pending {
                 pending_delta -= 1;
@@ -202,6 +254,7 @@ impl Table {
             }
             self.by_va.remove(&(ova, ores));
             if let Some(mut old) = self.by_res.remove(&ores) {
+                self.unlink_src(ores, old.src, old.tex.size() as usize);
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -230,8 +283,11 @@ impl Table {
         entry.seq = self.next_seq;
         if entry.pending {
             pending_delta += 1;
+            self.pending_res.insert(res);
         }
         self.by_va.insert((va, res), end);
+        let (src, size) = (entry.src, entry.tex.size() as usize);
+        self.link_src(res, src, size);
         self.by_res.insert(res, entry);
         (pending_delta, to_unmap)
     }
@@ -248,6 +304,7 @@ impl Table {
             return (true, 0, Vec::new(), st);
         }
         let Some(old) = self.by_res.remove(&res) else { return (false, 0, Vec::new(), None) };
+        self.unlink_src(res, old.src, old.tex.size() as usize);
         let st = (old.states.len() == 1).then(|| old.states[0]);
         self.by_va.remove(&(old.va, res));
         let mut pending_delta = if old.pending { -1 } else { 0 };
@@ -275,8 +332,11 @@ impl Table {
                 }
                 if e.pending {
                     pending_delta += 1;
+                    self.pending_res.insert(sres);
                 }
                 self.by_va.insert((sva, sres), send);
+                let (src, size) = (e.src, e.tex.size() as usize);
+                self.link_src(sres, src, size);
                 self.by_res.insert(sres, e);
             }
         }
@@ -386,6 +446,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         }
     }
     let in_gpu_view = crate::hle::kernelx::mirrors::source(va).is_some();
+    let tex_size = tex.size() as usize;
     let e = Entry {
         device: device as usize,
         va,
@@ -409,6 +470,8 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     for r in &to_unmap {
         super::vram::unmap_superseded(r);
     }
+    mark_hot_range(src, tex_size);
+    note_watched_texture_span(src, tex_size);
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
     Ok(())
 }
@@ -433,19 +496,66 @@ pub(super) fn mirror_source(va: usize) -> usize {
 fn recheck_gpu_view_sources() {
     static SEEN: AtomicU64 = AtomicU64::new(0);
     let gen = crate::hle::kernelx::gpu_view_map_gen();
-    if SEEN.swap(gen, Ordering::AcqRel) == gen {
+    let seen = SEEN.swap(gen, Ordering::AcqRel);
+    if seen == gen {
         return;
     }
     let mut remapped = Vec::new();
     // (the shadowed textures too: one comes back when the texture over it goes)
     let mut g = TEXTURES.lock().unwrap();
     let t = &mut *g;
-    for (&res, e) in t.by_res.iter_mut().chain(t.shadowed.iter_mut()) {
+    let names: Option<std::collections::BTreeSet<usize>> = crate::hle::kernelx::gpu_view_map_changes(seen).map(|ranges| {
+        let mut s = std::collections::BTreeSet::new();
+        for (lo, hi) in ranges {
+            s.extend(t.active_overlaps(lo, hi).into_iter().map(|(_, r, _)| r));
+            s.extend(t.shadowed_overlaps(lo, hi).into_iter().map(|(_, r, _)| r));
+        }
+        s
+    });
+    let mut moved: Vec<(usize, usize, usize, usize, bool)> = Vec::new();
+    let Table { by_res, shadowed, .. } = t;
+    let mut look = |res: usize, e: &mut Entry, active: bool| {
+        let (old, size) = (e.src, e.tex.size() as usize);
         if recheck_source(e) {
             remapped.push(res);
+            if active {
+                moved.push((res, old, e.src, size, e.pending));
+            }
+        }
+    };
+    match &names {
+        Some(s) => {
+            for &r in s {
+                if let Some(e) = by_res.get_mut(&r) {
+                    look(r, e, true);
+                } else if let Some(e) = shadowed.get_mut(&r) {
+                    look(r, e, false);
+                }
+            }
+        }
+        None => {
+            for (&r, e) in by_res.iter_mut() {
+                look(r, e, true);
+            }
+            for (&r, e) in shadowed.iter_mut() {
+                look(r, e, false);
+            }
         }
     }
+    let mut moved_spans = Vec::with_capacity(moved.len());
+    for (res, old, new, size, pending) in moved {
+        t.unlink_src(res, old, size);
+        t.link_src(res, new, size);
+        if pending {
+            t.pending_res.insert(res);
+        }
+        mark_hot_range(new, size);
+        moved_spans.push((new, size));
+    }
     drop(g);
+    for (new, size) in moved_spans {
+        note_watched_texture_span(new, size);
+    }
     if !remapped.is_empty() {
         let mut last = LAST_CONTENT.lock().unwrap();
         for res in remapped {
@@ -510,7 +620,11 @@ static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
 /// Under Wine, the coherent UMA window has no `MEM_WRITE_WATCH` (to avoid `amdgpu` userptr
 /// MMU-notifier stalls), so DirectStorage writes into it notify us directly here.
 pub fn mark_dirty_range(va: usize, len: usize) {
-    if !any() || len == 0 {
+    if len == 0 {
+        return;
+    }
+    mark_hot_range(va, len);
+    if !any() {
         return;
     }
     if !crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, len)) {
@@ -524,6 +638,7 @@ pub fn mark_dirty_range(va: usize, len: usize) {
         if let Some(e) = t.by_res.get_mut(&res) {
             if !e.gpu_written && !e.pending {
                 e.pending = true;
+                t.pending_res.insert(res);
                 added += 1;
             }
         }
@@ -703,10 +818,27 @@ thread_local! {
     static DIRTY_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+static WATCH_TEX_GEN: AtomicU64 = AtomicU64::new(0);
+
+fn note_watched_texture_span(src: usize, size: usize) {
+    if size == 0 {
+        return;
+    }
+    let covered = WATCH_CACHE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|(_, ranges)| range_is_fully_watched(src, size, ranges));
+    if !covered {
+        WATCH_TEX_GEN.fetch_add(1, Ordering::Release);
+    }
+}
+
 fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
+    let hot = hot_looks();
     let key = (
         super::sparse::mapped_gen(),
-        TEXTURES_GEN.load(Ordering::Acquire),
+        if hot { WATCH_TEX_GEN.load(Ordering::Acquire) } else { TEXTURES_GEN.load(Ordering::Acquire) },
         crate::hle::kernelx::graphics_reservations_gen(),
         super::list_x::mirror_sources_gen(),
     );
@@ -718,20 +850,51 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
             }
         }
     }
-    // Recompute the watched ranges (textures kept in step + mapped sparse tiles clipped to
-    // write-watched regions) only when the set of textures, tiles, or reservations changed.
+    // Recompute the watched ranges clipped to write-watched regions. Always bound `wanted` to
+    // actual textures + mapped sparse ranges + mirrors rather than full 60+ GiB uncommitted
+    // graphics reservations, so `xcl-watch-walk` sweeps only live memory and catches newly-written
+    // blocks in ~200 ms instead of several seconds.
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    let mut wanted: Vec<(usize, usize)> = TEXTURES
+        .lock()
+        .unwrap()
+        .by_res
+        .values()
+        .map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF))
+        .collect();
     wanted.extend(super::sparse::mapped_ranges());
     wanted.extend(super::sparse::gpu_view::sources());
     // the sources of buffer mirrors: a draw copies only the pages written (`list_x::copy_written`)
     wanted.extend(super::list_x::mirror_sources());
-    let computed = Arc::new(watch_ranges(&regions, wanted));
-    *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
+    let new_ranges = watch_ranges(&regions, wanted);
+    let mut g = WATCH_CACHE.lock().unwrap();
+    if let Some((_, ref old)) = *g {
+        if **old == new_ranges {
+            let reused = Arc::clone(old);
+            *g = Some((key, Arc::clone(&reused)));
+            return reused;
+        }
+    }
+    let computed = Arc::new(new_ranges);
+    *g = Some((key, Arc::clone(&computed)));
     computed
 }
 
+/// Profiling counters for `XCL_ACTIVITY=1` (nanoseconds / counts):
+/// 0: watch_ns, 1: sparse_vram_ns, 2: hash_ns, 3: detile_ns,
+/// 4: submit_tq_ns, 5: submit_tq_cnt, 6: submit_fb_ns, 7: submit_fb_cnt, 8: upload_bytes
+static PERF: [AtomicU64; 9] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+pub fn perf_snapshot() -> [u64; 9] {
+    std::array::from_fn(|i| PERF[i].load(Ordering::Relaxed))
+}
+
+/// The title's own memory: what the CPU wrote goes to its video memory first.
 /// Run `f` as XCL's own GPU work: ExecuteCommandLists inside it does not refresh.
 pub(super) fn own_work<R>(f: impl FnOnce() -> R) -> R {
     let was = BUSY.with(|b| b.replace(true));
@@ -748,8 +911,9 @@ pub(super) fn is_own_work() -> bool {
 /// Before the title's GPU work: textures whose memory the CPU wrote since the last look are
 /// uploaded again.
 pub(super) unsafe fn refresh(queue: *mut c_void) {
-    // the uploads' own ExecuteCommandLists come back here
-    if BUSY.with(|b| b.get()) {
+    // the uploads' own ExecuteCommandLists come back here, and XCL's own present copy reads no
+    // title memory (skipping it avoids 1/3 of all GetWriteWatch scans every frame)
+    if BUSY.with(|b| b.get()) || super::present::presenting() {
         return;
     }
     let _refresh = REFRESH.lock().unwrap();
@@ -773,6 +937,242 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
             break;
         }
         at = buf[n - 1] as usize + *page as usize;
+    }
+}
+
+/// `XCL_WATCH_HOT=0`: every look before a submit walks all the watched memory, as before.
+/// Otherwise a look takes only the 2 MiB blocks written recently, and a background thread walks
+/// the rest in 16 MiB steps and promotes a block to hot as soon as it sees a dirty page there
+/// (leaving the write-watch bits intact until a look takes them). Under Wine, `GetWriteWatch`
+/// walks pages linearly (~1 ms/GiB), so scanning 6–11 GiB per submit stalls video and world FPS.
+fn hot_looks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_WATCH_HOT").map_or(true, |v| v.trim() != "0"))
+}
+
+const HOT_BLOCK: usize = 2 << 20;
+
+/// Gap up to which hot blocks coalesce into one write-watch call (`XCL_WATCH_GAP_MB`: default
+/// 4 MiB under Wine where `GetWriteWatch` scans pages linearly, 64 MiB on native Windows).
+fn hot_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        let default_mb = if crate::util::under_wine() { 4 } else { 64 };
+        std::env::var("XCL_WATCH_GAP_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(default_mb) << 20
+    })
+}
+
+/// How long a block stays hot after its last dirty page (`XCL_WATCH_HOT_MS`, default 15000 ms
+/// under Wine so video/UI ring buffers never expire across stalls, 5000 ms on native Windows).
+fn hot_for() -> std::time::Duration {
+    static DUR: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *DUR.get_or_init(|| {
+        let default_ms = if crate::util::under_wine() { 15_000 } else { 5_000 };
+        let ms = std::env::var("XCL_WATCH_HOT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&v| v >= 20).unwrap_or(default_ms);
+        std::time::Duration::from_millis(ms)
+    })
+}
+
+#[derive(Default)]
+struct HotBlocks {
+    /// block -> when a look, walk, or DirectStorage write last touched it
+    hot: BTreeMap<usize, std::time::Instant>,
+    /// the ranges `known` was made for
+    ranges: Option<Arc<Vec<(usize, usize)>>>,
+    /// the blocks of those ranges (a block new to the ranges starts hot)
+    known: std::collections::HashSet<usize>,
+}
+
+static HOT: Mutex<Option<HotBlocks>> = Mutex::new(None);
+/// the ranges of the last look, for the walk
+static WALK_RANGES: Mutex<Option<Arc<Vec<(usize, usize)>>>> = Mutex::new(None);
+/// a look is in its write-watch calls: the walk yields so it never stalls the render thread
+static LOOKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// looks, runs they took, bytes they covered, blocks the walk made hot
+static HOT_STATS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+fn mark_hot_range(va: usize, len: usize) {
+    if !hot_looks() || len == 0 {
+        return;
+    }
+    let end = va.saturating_add(len);
+    let now = std::time::Instant::now();
+    let mut g = HOT.lock().unwrap();
+    let h = g.get_or_insert_with(HotBlocks::default);
+    let mut b = va & !(HOT_BLOCK - 1);
+    while b < end {
+        h.hot.insert(b, now);
+        match b.checked_add(HOT_BLOCK) {
+            Some(next) => b = next,
+            None => break,
+        }
+    }
+}
+
+/// The written pages of the hot blocks inside `ranges` (see `hot_looks`).
+unsafe fn take_hot(ranges: &Arc<Vec<(usize, usize)>>, buf: &mut [*mut c_void], dirty: &mut Vec<usize>, page: &mut u32) {
+    start_walk(ranges);
+    let now = std::time::Instant::now();
+    let keep = hot_for();
+    let (runs, hot_now): (Vec<(usize, usize)>, usize) = {
+        let mut g = HOT.lock().unwrap();
+        let h = g.get_or_insert_with(HotBlocks::default);
+        // a block new to the ranges starts hot: memory just mapped is often written and used at once
+        if !h.ranges.as_ref().is_some_and(|r| Arc::ptr_eq(r, ranges)) {
+            let mut known = std::collections::HashSet::with_capacity(h.known.len());
+            for &(base, size) in ranges.iter() {
+                let mut b = base & !(HOT_BLOCK - 1);
+                while b < base + size {
+                    if !h.known.contains(&b) {
+                        h.hot.insert(b, now);
+                    }
+                    known.insert(b);
+                    b += HOT_BLOCK;
+                }
+            }
+            h.known = known;
+            h.ranges = Some(Arc::clone(ranges));
+        }
+        h.hot.retain(|_, t| now.duration_since(*t) < keep);
+        // the hot blocks as runs, each inside one range (a write-watch call covers one allocation)
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (&b, _) in h.hot.iter() {
+            let mut j = ranges.partition_point(|&(base, size)| base + size <= b);
+            while let Some(&(base, size)) = ranges.get(j) {
+                if base >= b + HOT_BLOCK {
+                    break;
+                }
+                let (lo, hi) = (b.max(base), (b + HOT_BLOCK).min(base + size));
+                if lo < hi {
+                    match runs.last_mut() {
+                        Some(last) if last.0 >= base && lo - (last.0 + last.1) <= hot_gap() => last.1 = hi - last.0,
+                        _ => runs.push((lo, hi - lo)),
+                    }
+                }
+                j += 1;
+            }
+        }
+        (runs, h.hot.len())
+    };
+    let first = dirty.len();
+    LOOKING.store(true, Ordering::Release);
+    for &(base, size) in &runs {
+        take_written(base, size, buf, dirty, page);
+    }
+    LOOKING.store(false, Ordering::Release);
+    if dirty.len() > first {
+        let mut g = HOT.lock().unwrap();
+        if let Some(h) = g.as_mut() {
+            let mut last = usize::MAX;
+            for &p in &dirty[first..] {
+                let b = p & !(HOT_BLOCK - 1);
+                if b != last {
+                    h.hot.insert(b, now);
+                    last = b;
+                }
+            }
+        }
+    }
+    let n = HOT_STATS[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let r = HOT_STATS[1].fetch_add(runs.len() as u64, Ordering::Relaxed) + runs.len() as u64;
+    let covered: usize = runs.iter().map(|r| r.1).sum();
+    let bytes = HOT_STATS[2].fetch_add(covered as u64, Ordering::Relaxed) + covered as u64;
+    if n.is_power_of_two() && n >= 256 {
+        let watched: usize = ranges.iter().map(|r| r.1).sum();
+        crate::xlog_info!(
+            "D3D12.X: looks for CPU writes: {n} so far, {} runs and {} MB a look on average ({} MB watched in {} ranges); {hot_now} blocks hot now, {} made hot by the walk",
+            r / n,
+            (bytes / n) >> 20,
+            watched >> 20,
+            ranges.len(),
+            HOT_STATS[3].load(Ordering::Relaxed)
+        );
+    }
+}
+
+fn start_walk(ranges: &Arc<Vec<(usize, usize)>>) {
+    {
+        let mut g = WALK_RANGES.lock().unwrap();
+        if !g.as_ref().is_some_and(|r| Arc::ptr_eq(r, ranges)) {
+            *g = Some(Arc::clone(ranges));
+        }
+    }
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("xcl-watch-walk".into()).spawn(|| unsafe { walk() });
+        crate::xlog_info!(
+            "D3D12.X: a look for CPU writes takes the blocks written in the last {} ms; a thread walks the rest (XCL_WATCH_HOT=0: every look walks everything)",
+            hot_for().as_millis()
+        );
+    });
+}
+
+/// The walk: all watched memory in small steps, without resetting write-watch bits (they stay
+/// reported until a look takes them); a block with a written page is hot from then on.
+unsafe fn walk() {
+    // Under Wine, `GetWriteWatch` holds the process virtual-memory lock linearly over the scanned
+    // span: small 4 MiB steps with periodic 1 ms yields and a 50 ms pass pause keep `xcl-watch-walk`
+    // from starving boot `VirtualAlloc`, `take_hot`, and `PresentX` while `hot_for()` (5000 ms)
+    // keeps active video/UI planes continuously hot.
+    let wine = crate::util::under_wine();
+    let step: usize = if wine { 4 << 20 } else { 32 << 20 };
+    let pause_ms: u64 = if wine { 50 } else { 15 };
+    let mut buf: Vec<*mut c_void> = vec![std::ptr::null_mut(); 8192];
+    let mut found: Vec<usize> = Vec::new();
+    let mut scanned_since_yield = 0usize;
+    loop {
+        let ranges = WALK_RANGES.lock().unwrap().clone();
+        let Some(ranges) = ranges else {
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+            continue;
+        };
+        for &(base, size) in ranges.iter() {
+            let end = base + size;
+            let mut at = base;
+            while at < end {
+                let stop = (at + step).min(end);
+                let mut from = at;
+                while LOOKING.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                while from < stop {
+                    let (mut n, mut page) = (buf.len(), 0u32);
+                    if GetWriteWatch(0, from as *const c_void, stop - from, buf.as_mut_ptr(), &mut n, &mut page) != 0 || n == 0 {
+                        break;
+                    }
+                    let mut last = usize::MAX;
+                    for &p in &buf[..n] {
+                        let b = p as usize & !(HOT_BLOCK - 1);
+                        if b != last {
+                            found.push(b);
+                            last = b;
+                        }
+                    }
+                    if n < buf.len() {
+                        break;
+                    }
+                    from = (buf[n - 1] as usize & !(HOT_BLOCK - 1)) + HOT_BLOCK;
+                }
+                if !found.is_empty() {
+                    let now = std::time::Instant::now();
+                    let mut g = HOT.lock().unwrap();
+                    let h = g.get_or_insert_with(HotBlocks::default);
+                    for b in found.drain(..) {
+                        if let std::collections::btree_map::Entry::Vacant(v) = h.hot.entry(b) {
+                            v.insert(now);
+                            HOT_STATS[3].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                scanned_since_yield += stop - at;
+                if wine && scanned_since_yield >= (32 << 20) {
+                    scanned_since_yield = 0;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                at = stop;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(pause_ms));
     }
 }
 
@@ -802,8 +1202,12 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 buf.resize(16384, std::ptr::null_mut());
             }
             super::list_x::mirror_look_begin();
-            for &(base, size) in ranges.iter() {
-                take_written(base, size, &mut buf, &mut dirty, &mut page);
+            if hot_looks() {
+                take_hot(&ranges, &mut buf, &mut dirty, &mut page);
+            } else {
+                for &(base, size) in ranges.iter() {
+                    take_written(base, size, &mut buf, &mut dirty, &mut page);
+                }
             }
         });
         dirty.sort_unstable();
@@ -811,7 +1215,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
         super::list_x::mirror_pages_written(&dirty);
         dirty.len()
     });
-    super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    let watch_dt = watch_t0.elapsed();
+    PERF[0].fetch_add(watch_dt.as_nanos() as u64, Ordering::Relaxed);
+    super::sparse::note_watch(watch_dt, dirty_len);
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)
@@ -841,13 +1247,16 @@ unsafe fn refresh_once(queue: *mut c_void) {
         }
     }
     // the title's own memory: what the CPU wrote goes to its video memory first
+    let sv_t0 = std::time::Instant::now();
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         DIRTY_BUF.with(|dcell| {
             let dirty = dcell.borrow();
             super::sparse::before_execute(q, &dirty, page as usize);
             super::vram::before_execute(q);
         });
+        wait_other_upload_queues(q);
     }
+    PERF[1].fetch_add(sv_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let recheck_frame = {
         let (p, b) = super::present::counters();
         p.max(b)
@@ -865,9 +1274,15 @@ unsafe fn refresh_once(queue: *mut c_void) {
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
-        t.by_res
-            .iter_mut()
-            .filter_map(|(&res, e)| {
+        let mut names = t.touched_by(&dirty);
+        names.extend(std::mem::take(&mut t.pending_res));
+        if wine_hash_committed {
+            names.extend(t.committed_res.iter().copied());
+        }
+        names
+            .into_iter()
+            .filter_map(|res| {
+                let e = t.by_res.get_mut(&res)?;
                 let dirty_pages = if e.pending {
                     e.pending = false;
                     PENDING.fetch_sub(1, Ordering::Relaxed);
@@ -879,7 +1294,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     // submit in `upload_all` (`changed_pages_since_last_upload`); large static
                     // ones are notified by DirectStorage (`mark_dirty_range`) and swept 1/16.
                     let size = e.tex.size() as usize;
-                    if size > (4 << 20) && (e.seq & 15) != (hash_tick & 15) {
+                    if size > (16 << 20) && (e.seq & 15) != (hash_tick & 15) {
                         return None;
                     }
                     None
@@ -910,7 +1325,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
             .collect()
     });
     seed_stream_recheck(&todo, &ranges, recheck_frame);
-    upload_all(todo);
+    upload_all(todo, ID3D12CommandQueue::from_raw_borrowed(&queue));
 }
 
 struct PageHashes {
@@ -1037,10 +1452,11 @@ where
     }
 }
 
-/// Per-page change check backed by safe `read_committed` (outside coherent window / under Wine) for `upload_all`.
+/// Per-page change check backed by direct read inside the committed coherent window and safe
+/// `read_committed` outside it, for `upload_all`.
 unsafe fn changed_pages_since_last_upload(res: usize, src: usize, size: usize, dirty_pages: Option<&[usize]>, page_size: usize) -> Option<Vec<usize>> {
     changed_pages_with(res, src, size, dirty_pages, page_size, |at, len| {
-        if !crate::util::under_wine() && crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
+        if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
             std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
         } else {
             std::borrow::Cow::Owned(read_committed(at, len))
@@ -1257,6 +1673,7 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) 
                 if let Some(e) = t.by_res.get_mut(&res) {
                     if !e.gpu_written && !e.pending {
                         e.pending = true;
+                        t.pending_res.insert(res);
                         PENDING.fetch_add(1, Ordering::Relaxed);
                         queued += 1;
                     }
@@ -1289,8 +1706,145 @@ fn batch_fits(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_d
             && picked_bytes.saturating_add(next_bytes) <= BATCH_BYTES)
 }
 
-/// The uploads `todo`, in batches of up to `BATCH_BYTES` and `BATCH_ITEMS` (one list and one wait each).
-unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
+struct QueueUploads {
+    dev: usize,
+    fence: ID3D12Fence,
+    value: u64,
+    in_flight: std::collections::VecDeque<(u64, texture::UploadSlot)>,
+    free: Vec<texture::UploadSlot>,
+    bytes: u64,
+}
+
+unsafe impl Send for QueueUploads {}
+
+static ON_QUEUE: Mutex<BTreeMap<usize, QueueUploads>> = Mutex::new(BTreeMap::new());
+static HAS_ON_QUEUE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+const IN_FLIGHT_BYTES: u64 = 128 << 20;
+const FREE_SLOTS_KEPT: usize = 3;
+const FREE_SLOT_MAX_STAGING: u64 = 32 << 20;
+
+unsafe fn title_queue_for(dev: &ID3D12Device, title: Option<&ID3D12CommandQueue>) -> Option<ID3D12CommandQueue> {
+    let q = title?;
+    if q.GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
+        return None;
+    }
+    if super::sparse::queue_has_unsatisfied_wait(q.as_raw() as usize) {
+        return None;
+    }
+    let mut qd: Option<ID3D12Device> = None;
+    q.GetDevice(&mut qd).ok()?;
+    (qd?.as_raw() == dev.as_raw()).then(|| q.clone())
+}
+
+/// Before `q` executes title work, order it after any in-flight non-blocking texture uploads
+/// queued on *other* direct queues of the same device (GPU-side fence wait, zero CPU stall).
+unsafe fn wait_other_upload_queues(q: &ID3D12CommandQueue) {
+    if !HAS_ON_QUEUE.load(Ordering::Acquire) {
+        return;
+    }
+    let mut qd: Option<ID3D12Device> = None;
+    if q.GetDevice(&mut qd).is_err() {
+        return;
+    }
+    let Some(dev) = qd else { return };
+    let dev_key = dev.as_raw() as usize;
+    let q_key = q.as_raw() as usize;
+    let waits: Vec<(ID3D12Fence, u64)> = {
+        let g = ON_QUEUE.lock().unwrap();
+        g.iter()
+            .filter(|(&k, u)| k != q_key && u.dev == dev_key && u.value > 0 && u.fence.GetCompletedValue() < u.value)
+            .map(|(_, u)| (u.fence.clone(), u.value))
+            .collect()
+    };
+    for (fence, value) in waits {
+        let _ = q.Wait(&fence, value);
+    }
+}
+
+unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u32) {
+    let done = q.fence.GetCompletedValue();
+    let recycle = |free: &mut Vec<texture::UploadSlot>, slot: texture::UploadSlot| {
+        if free.len() < FREE_SLOTS_KEPT && slot.staging_cap() <= FREE_SLOT_MAX_STAGING {
+            free.push(slot);
+        }
+    };
+    while q.in_flight.front().is_some_and(|&(v, _)| v <= done) {
+        let (_, f) = q.in_flight.pop_front().unwrap();
+        q.bytes -= f.bytes;
+        recycle(&mut q.free, f);
+    }
+    while q.bytes > cap {
+        let Some(&(v, _)) = q.in_flight.front() else { break };
+        if crate::gpu::fence::wait(&q.fence, v, dev, None, wait_ms).is_err() {
+            break;
+        }
+        let (_, f) = q.in_flight.pop_front().unwrap();
+        q.bytes -= f.bytes;
+        recycle(&mut q.free, f);
+    }
+}
+
+unsafe fn submit_on_title_queue(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    batch: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)],
+) -> Result<Vec<(usize, String)>, String> {
+    let key = queue.as_raw() as usize;
+    let slot = {
+        let mut g = ON_QUEUE.lock().unwrap();
+        if let Some(q) = g.get_mut(&key) {
+            reclaim(dev, q, IN_FLIGHT_BYTES, 10_000);
+            q.free.pop()
+        } else {
+            None
+        }
+    };
+    let (failed, f) = texture::submit_batch_with_slot(dev, queue, batch, slot)?;
+    let Some(f) = f else { return Ok(failed) };
+    let mut g = ON_QUEUE.lock().unwrap();
+    if !g.contains_key(&key) {
+        match super::real::create_raw_fence(dev) {
+            Ok(fence) => {
+                g.insert(
+                    key,
+                    QueueUploads {
+                        dev: dev.as_raw() as usize,
+                        fence,
+                        value: 0,
+                        in_flight: std::collections::VecDeque::new(),
+                        free: Vec::new(),
+                        bytes: 0,
+                    },
+                );
+                HAS_ON_QUEUE.store(true, Ordering::Release);
+            }
+            Err(e) => {
+                texture::wait(dev, queue)?;
+                drop(f);
+                return Err(e.to_string());
+            }
+        }
+    }
+    let q = g.get_mut(&key).unwrap();
+    q.value += 1;
+    if let Err(e) = queue.Signal(&q.fence, q.value) {
+        q.value -= 1;
+        texture::wait(dev, queue)?;
+        drop(f);
+        return Err(e.to_string());
+    }
+    q.bytes += f.bytes;
+    let v = q.value;
+    q.in_flight.push_back((v, f));
+    reclaim(dev, q, IN_FLIGHT_BYTES, 10_000);
+    Ok(failed)
+}
+
+/// The uploads `todo`, in batches of up to `BATCH_BYTES` and `BATCH_ITEMS`. When the submitting
+/// queue is a DIRECT queue on the same device, uploads are queued directly on it without blocking
+/// the CPU on a fence wait; otherwise they fall back to XCL's synchronous upload queue.
+unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12CommandQueue>) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -1302,6 +1856,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         let mut picked = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
+        let hash_t0 = std::time::Instant::now();
         while let Some((_, u)) = todo.peek() {
             if !batch_fits(picked.len(), bytes, device, u.device, u.tex.size() as usize) {
                 break;
@@ -1324,9 +1879,11 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             bytes += u.tex.size() as usize;
             picked.push((r, u.src, u.tex, u.states));
         }
+        PERF[2].fetch_add(hash_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if picked.is_empty() {
             continue;
         }
+        let detile_t0 = std::time::Instant::now();
         let subs = subresources_of_all(&picked, bytes);
         let mut batch = Vec::with_capacity(picked.len());
         for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
@@ -1339,12 +1896,35 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
             batch.push((r, subs, states));
         }
+        PERF[3].fetch_add(detile_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        PERF[8].fetch_add(bytes as u64, Ordering::Relaxed);
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
+        if let Some(tq) = title_queue_for(dev, title) {
+            let sub_t0 = std::time::Instant::now();
+            match own_work(|| {
+                super::vram::before_execute(&tq);
+                submit_on_title_queue(dev, &tq, &batch)
+            }) {
+                Ok(failed) => {
+                    for (_, e) in failed {
+                        warn(&e);
+                    }
+                    UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                }
+                Err(e) => warn(&e),
+            }
+            recycle_batch_bufs(batch);
+            PERF[4].fetch_add(sub_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            PERF[5].fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let sub_t0 = std::time::Instant::now();
         let queue = match upload_queue(dev, device) {
             Ok(q) => q,
             Err(e) => {
                 warn(&e);
+                recycle_batch_bufs(batch);
                 continue;
             }
         };
@@ -1360,6 +1940,9 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
             Err(e) => warn(&e),
         }
+        recycle_batch_bufs(batch);
+        PERF[6].fetch_add(sub_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        PERF[7].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1596,6 +2179,85 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     out
 }
 
+#[cfg(target_arch = "x86_64")]
+std::arch::global_asm!(
+    ".global xcl_safe_memcpy",
+    ".global xcl_safe_memcpy_start",
+    ".global xcl_safe_memcpy_end",
+    ".global xcl_safe_memcpy_fault",
+    "xcl_safe_memcpy:",
+    "push rdi",
+    "push rsi",
+    "mov rdi, rcx",
+    "mov rsi, rdx",
+    "mov rcx, r8",
+    "cld",
+    "xcl_safe_memcpy_start:",
+    "rep movsb",
+    "xcl_safe_memcpy_end:",
+    "pop rsi",
+    "pop rdi",
+    "mov al, 1",
+    "ret",
+    "xcl_safe_memcpy_fault:",
+    "pop rsi",
+    "pop rdi",
+    "xor eax, eax",
+    "ret",
+);
+
+#[cfg(target_arch = "x86_64")]
+extern "C" {
+    fn xcl_safe_memcpy(dst: *mut u8, src: *const u8, len: usize) -> u8;
+    static xcl_safe_memcpy_start: u8;
+    static xcl_safe_memcpy_end: u8;
+    static xcl_safe_memcpy_fault: u8;
+}
+
+/// Vectored exception handler recovering `STATUS_ACCESS_VIOLATION` inside `xcl_safe_memcpy`
+/// without triggering `kernelx::lazy` or touching `wineserver`.
+#[cfg(target_arch = "x86_64")]
+unsafe extern "system" fn safe_copy_veh(info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
+    const STATUS_ACCESS_VIOLATION: i32 = 0xC0000005u32 as i32;
+    const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+    if info.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let rec = (*info).ExceptionRecord;
+    let ctx = (*info).ContextRecord;
+    if !rec.is_null() && !ctx.is_null() && (*rec).ExceptionCode == STATUS_ACCESS_VIOLATION {
+        let rip = (*ctx).Rip as usize;
+        let start = &xcl_safe_memcpy_start as *const u8 as usize;
+        let end = &xcl_safe_memcpy_end as *const u8 as usize;
+        if rip >= start && rip < end {
+            (*ctx).Rip = &xcl_safe_memcpy_fault as *const u8 as u64;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Direct in-process `memcpy` with VEH recovery on `STATUS_ACCESS_VIOLATION`. Only used for UMA
+/// sparse memory (which never contains `PAGE_GUARD` pages), bypassing Wine's `wineserver` IPC in
+/// `ReadProcessMemory` (~60× faster for 4K video planes and streamed textures).
+#[cfg(target_arch = "x86_64")]
+unsafe fn try_safe_memcpy(src: usize, dst: *mut u8, len: usize) -> bool {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(safe_copy_veh));
+    });
+    if len == 0 {
+        return true;
+    }
+    xcl_safe_memcpy(dst, src as *const u8, len) != 0
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn try_safe_memcpy(_src: usize, _dst: *mut u8, _len: usize) -> bool {
+    false
+}
+
 /// `read_committed` of `out.len()` bytes at `at` into `out` (every byte of it written).
 unsafe fn read_committed_into(at: usize, out: &mut [u8]) {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
@@ -1603,20 +2265,44 @@ unsafe fn read_committed_into(at: usize, out: &mut [u8]) {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let len = out.len();
     let Some(limit) = at.checked_add(len) else { return out.fill(0) };
-    // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
-    // walking it; still copy via `ReadProcessMemory` so an unreadable page never faults)
-    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
-        copy_committed_region_impl(at, out.as_mut_ptr(), len, true);
+    if len == 0 {
         return;
+    }
+    // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
+    // walking it; in-process copy is safe since the coherent window is never decommitted)
+    let mut sparse_fast = false;
+    if let Some(u) = crate::gpu::uma::get() {
+        if u.in_committed_window(at, len) {
+            std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
+            return;
+        }
+        // Under Wine, `ReadProcessMemory(GetCurrentProcess(), ...)` copies through `wineserver`
+        // (~650 MB/s), stalling 4K video playback. UMA sparse windows and `kernelx` graphics
+        // reservations never contain `PAGE_GUARD`, so VEH-guarded direct `memcpy` runs at memory
+        // bandwidth (~40 GB/s) and falls through cleanly to the hole-aware path if any page is
+        // uncommitted or concurrently decommitted.
+        if crate::util::under_wine() && (u.is_sparse(at) || crate::hle::kernelx::in_graphics_reservation(at)) {
+            sparse_fast = true;
+            if try_safe_memcpy(at, out.as_mut_ptr(), len) {
+                return;
+            }
+        }
+    } else if crate::util::under_wine() && crate::hle::kernelx::in_graphics_reservation(at) {
+        sparse_fast = true;
+        if try_safe_memcpy(at, out.as_mut_ptr(), len) {
+            return;
+        }
     }
     // All of it readable (the usual case): one copy. `VirtualQuery` scans from the page asked
     // about to the end of its run of like pages, and the title's memory is a few runs of hundreds
     // of MiB – a 16 KiB texture cost ~120 µs at the start of a 64 MiB run, ~1.3 ms of 512 MiB.
     // `ReadProcessMemory` refuses a range with a page that is not committed, no-access or a guard
     // page (and leaves the guard in place: `title_bytes_leave_guard_pages_alone`).
-    let mut read = 0usize;
-    if len == 0 || ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out.as_mut_ptr() as *mut c_void, len, &mut read) != 0 {
-        return;
+    if !sparse_fast {
+        let mut read = 0usize;
+        if ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out.as_mut_ptr() as *mut c_void, len, &mut read) != 0 {
+            return;
+        }
     }
     // with holes: region by region (a refused `ReadProcessMemory` costs more than the walk)
     let mut p = at;
@@ -1631,7 +2317,9 @@ unsafe fn read_committed_into(at: usize, out: &mut [u8]) {
         }
         let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0; // R / RW / WC / X-R…, no guard
         if readable {
-            copy_committed_region_impl(p, out.as_mut_ptr().add(p - at), end - p, true);
+            if !(sparse_fast && try_safe_memcpy(p, out.as_mut_ptr().add(p - at), end - p)) {
+                copy_committed_region_impl(p, out.as_mut_ptr().add(p - at), end - p, true);
+            }
         } else {
             out[p - at..end - at].fill(0);
         }
@@ -1643,12 +2331,49 @@ unsafe fn read_committed_into(at: usize, out: &mut [u8]) {
 /// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
 const PARALLEL_BYTES: usize = 1 << 20;
 
+/// Pool of reusable detile output buffers (`>= 256 KiB` up to `32 MiB`) so per-frame video
+/// uploads do not `mmap` + zero-fault + `munmap` tens of MiB every frame on Wine's heap.
+static DETILE_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+const DETILE_POOL_MIN: usize = 256 << 10;
+const DETILE_POOL_MAX: usize = 32 << 20;
+const DETILE_POOL_KEPT: usize = 12;
+
+fn take_detile_buf(needed: usize) -> Vec<u8> {
+    if needed >= DETILE_POOL_MIN && needed <= DETILE_POOL_MAX {
+        let mut g = DETILE_POOL.lock().unwrap();
+        if let Some(pos) = g.iter().position(|v| v.capacity() >= needed) {
+            return g.swap_remove(pos);
+        }
+        if let Some(v) = g.pop() {
+            return v;
+        }
+    }
+    Vec::new()
+}
+
+fn recycle_batch_bufs(batch: Vec<(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)>) {
+    let mut g = DETILE_POOL.lock().unwrap();
+    for (_, subs, _) in batch {
+        for mut s in subs {
+            let cap = s.data.capacity();
+            if g.len() < DETILE_POOL_KEPT && cap >= DETILE_POOL_MIN && cap <= DETILE_POOL_MAX {
+                s.data.clear();
+                g.push(s.data);
+            }
+        }
+    }
+}
+
 /// `subresources` of every texture of a batch (`bytes` of them), in order: on several threads
-/// when the batch is big. They were read and detiled one after another in the title's own
-/// submit – most of a retail game's render thread while it streamed textures the CPU writes.
+/// when the batch is big. Under Wine, avoid spawning ephemeral OS threads per video frame (which
+/// discards `TITLE_BYTES` TLS and triggers `DLL_THREAD_ATTACH` + `wineserver` overhead).
 unsafe fn subresources_of_all(picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>)], bytes: usize) -> Vec<Vec<Subresource>> {
     let picked: Vec<(usize, &xg::Texture)> = picked.iter().map(|(_, va, tex, _)| (*va, &**tex)).collect();
-    let threads = if bytes < PARALLEL_BYTES { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8) };
+    let threads = if bytes < PARALLEL_BYTES || (crate::util::under_wine() && picked.len() <= 4) {
+        1
+    } else {
+        std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8)
+    };
     subresources_on(&picked, threads)
 }
 
@@ -1695,11 +2420,11 @@ thread_local! {
 const TITLE_BYTES_KEPT: usize = 64 << 20;
 
 /// `f` of the title's `len` bytes at `at`: where they are in the coherent window (committed as a
-/// whole, never decommitted; copied safely under Wine), else as `read_committed` reads them, into
-/// a buffer reused on this thread – the title can decommit its other memory from another thread at
-/// any moment, and a read in place then faults.
+/// whole, never decommitted), used in place; else as `read_committed` reads them, into a buffer
+/// reused on this thread – the title can decommit its other memory from another thread at any
+/// moment, and a read in place then faults.
 unsafe fn with_title_bytes<R>(at: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
-    if !crate::util::under_wine() && crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         return f(std::slice::from_raw_parts(at as *const u8, len));
     }
     TITLE_BYTES.with(|b| match b.try_borrow_mut() {
@@ -1732,7 +2457,10 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     for s in 0..tex.array as usize {
         with_title_bytes(va + s * c.slice_bytes, c.slice_bytes, |slice| {
             for (i, l) in c.levels.iter().enumerate() {
-                out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(slice, i, s) });
+                let needed = l.width * l.height * bpe;
+                let mut data = take_detile_buf(needed);
+                c.detile_level_into(slice, i, s, &mut data);
+                out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data });
             }
         });
     }
@@ -2420,11 +3148,7 @@ mod tests {
         unsafe {
             std::ptr::write_bytes(p, 0x5C, 1 << 16);
             with_title_bytes(p as usize, 1 << 16, |b| {
-                if !crate::util::under_wine() {
-                    assert_eq!(b.as_ptr(), p as *const u8, "the coherent window is read in place");
-                } else {
-                    assert_ne!(b.as_ptr(), p as *const u8, "under Wine the coherent window uses the safe copy");
-                }
+                assert_eq!(b.as_ptr(), p as *const u8, "the coherent window is read in place");
                 assert!(b.len() == 1 << 16 && b.iter().all(|&x| x == 0x5C));
             });
         }
@@ -3307,6 +4031,22 @@ mod tests {
             let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
             VirtualQuery((base + (1 << 12)) as *const c_void, &mut m, std::mem::size_of_val(&m));
             assert_ne!(m.Protect & PAGE_GUARD, 0, "the guard page is still a guard page");
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn try_safe_memcpy_recovers_from_uncommitted_hole() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 << 12, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            std::ptr::write_bytes(base as *mut u8, 0x5A, 3 << 12);
+            let mut dst = vec![0u8; 3 << 12];
+            assert!(try_safe_memcpy(base, dst.as_mut_ptr(), dst.len()), "committed span copies cleanly");
+            assert!(dst.iter().all(|&b| b == 0x5A));
+            VirtualFree((base + (1 << 12)) as *mut c_void, 1 << 12, MEM_DECOMMIT);
+            assert!(!try_safe_memcpy(base, dst.as_mut_ptr(), dst.len()), "uncommitted middle page must return false via VEH without crashing");
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
     }

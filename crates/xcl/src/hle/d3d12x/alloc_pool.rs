@@ -165,26 +165,43 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
     if !enabled() {
         return 0;
     }
-    let mut g = STATE.lock().unwrap();
-    let Some(s) = g.as_mut() else { return 0 };
     let mut found = 0;
-    for &l in lists {
-        let l = l as usize;
-        let Some(last) = s.last_submit.get(&l) else { continue };
-        if last.fence.GetCompletedValue() >= last.value {
-            continue;
+    let mut waits: Vec<(ID3D12Fence, u64)> = Vec::new();
+    {
+        let mut g = STATE.lock().unwrap();
+        let Some(s) = g.as_mut() else { return 0 };
+        for &l in lists {
+            let l = l as usize;
+            let Some(last) = s.last_submit.get(&l) else { continue };
+            if last.fence.GetCompletedValue() >= last.value {
+                continue;
+            }
+            let same_recording = s.recordings.get(&l).copied().unwrap_or(0) == last.recording;
+            let same_queue = last.queue == queue as usize;
+            found += 1;
+            s.resubmits += 1;
+            let n = s.resubmits;
+            if n <= 8 || n.is_power_of_two() {
+                crate::xlog_warn!(
+                    "D3D12.X: a command list is submitted while its previous submit is still on the GPU ({}, {}; #{n} so far) – the PC does not allow it (debug layer id 553)",
+                    if same_recording { "the same recording" } else { "a new recording" },
+                    if same_queue { "the same queue" } else { "another queue" },
+                );
+            }
+            // Under Wine/vkd3d-proton, primary VkCommandBuffers lack SIMULTANEOUS_USE_BIT, so
+            // resubmitting an in-flight command list causes black-frame flickering / device hangs.
+            // Wait briefly for its previous execution unless its queue is blocked on a later submit.
+            if crate::util::under_wine() && !super::sparse::queue_has_unsatisfied_wait(last.queue) {
+                waits.push((last.fence.clone(), last.value));
+            }
         }
-        let same_recording = s.recordings.get(&l).copied().unwrap_or(0) == last.recording;
-        let same_queue = last.queue == queue as usize;
-        found += 1;
-        s.resubmits += 1;
-        let n = s.resubmits;
-        if n <= 8 || n.is_power_of_two() {
-            crate::xlog_warn!(
-                "D3D12.X: a command list is submitted while its previous submit is still on the GPU ({}, {}; #{n} so far) – the PC does not allow it (debug layer id 553)",
-                if same_recording { "the same recording" } else { "a new recording" },
-                if same_queue { "the same queue" } else { "another queue" },
-            );
+    }
+    for (fence, target) in waits {
+        if fence.GetCompletedValue() < target {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            while fence.GetCompletedValue() < target && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
         }
     }
     found

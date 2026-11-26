@@ -52,6 +52,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
             };
             let mut last = snap();
             let mut last_sync = crate::hle::d3d12x::list_x::sync_activity();
+            let mut last_tt = crate::hle::d3d12x::title_textures::perf_snapshot();
+            let mut last_ex = crate::hle::d3d12x::real::exec_perf_snapshot();
+            let mut last_px = crate::hle::d3d12x::present::present_x_ns();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -60,6 +63,20 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed",
                     d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
                 );
+                let tt = crate::hle::d3d12x::title_textures::perf_snapshot();
+                let ex = crate::hle::d3d12x::real::exec_perf_snapshot();
+                let px = crate::hle::d3d12x::present::present_x_ns();
+                let ms = |ns: u64| ns as f64 / 1e6;
+                crate::xlog_info!(
+                    "perf (2 s): watch {:.1} ms, sparse+vram {:.1} ms, tex-hash {:.1} ms, detile {:.1} ms, upload-tq {:.1} ms ({}), upload-fb {:.1} ms ({}), {} MB; native-exec {:.1} ms, post-exec {:.1} ms, present_x {:.1} ms",
+                    ms(tt[0] - last_tt[0]), ms(tt[1] - last_tt[1]), ms(tt[2] - last_tt[2]), ms(tt[3] - last_tt[3]),
+                    ms(tt[4] - last_tt[4]), tt[5] - last_tt[5], ms(tt[6] - last_tt[6]), tt[7] - last_tt[7],
+                    (tt[8] - last_tt[8]) >> 20,
+                    ms(ex[0] - last_ex[0]), ms(ex[1] - last_ex[1]), ms(px - last_px)
+                );
+                last_tt = tt;
+                last_ex = ex;
+                last_px = px;
                 // the per-draw sync of buffer mirrors (only once a mirror exists)
                 let sync = crate::hle::d3d12x::list_x::sync_activity();
                 let s: Vec<u64> = sync.iter().zip(last_sync).map(|(a, b)| a - b).collect();

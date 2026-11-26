@@ -8048,6 +8048,12 @@ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT
     hr
 }
 
+static EXEC_PERF: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+pub fn exec_perf_snapshot() -> [u64; 2] {
+    [EXEC_PERF[0].load(Ordering::Relaxed), EXEC_PERF[1].load(Ordering::Relaxed)]
+}
+
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
@@ -8079,14 +8085,18 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         let _ = super::alloc_pool::note_resubmits(this, chunk);
         {
+            let t0 = std::time::Instant::now();
             let _list_guards: Vec<_> = chunk.iter().filter_map(|&l| UnadoptGuard::new(l)).collect();
             f(this, chunk.len() as u32, chunk.as_ptr());
+            EXEC_PERF[0].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
+        let post_t0 = std::time::Instant::now();
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
+        EXEC_PERF[1].fetch_add(post_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     });
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);

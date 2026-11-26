@@ -424,10 +424,19 @@ impl Chain {
     /// level `i` of array slice `slice` (`src` = the slice's bytes) → linear rows of elements;
     /// bytes past the end of `src` read as 0
     pub fn detile_level(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.detile_level_into(src, i, slice, &mut out);
+        out
+    }
+
+    /// Like `detile_level`, writing into caller-supplied buffer `out` (reusing its allocation).
+    pub fn detile_level_into(&self, src: &[u8], i: usize, slice: usize, out: &mut Vec<u8>) {
         let l = self.levels[i];
         let t = &self.layout;
         let e = 1usize << t.elem_log2;
-        let mut out = vec![0u8; l.width * l.height * e];
+        let needed = l.width * l.height * e;
+        out.clear();
+        out.resize(needed, 0);
         if t.mode == 0 && t.base_xor == 0 && l.origin == (0, 0) {
             // linear: a row's elements are contiguous, so it is copied whole (the elements that
             // are all in `src`, as below) – a video plane of 3840×2160 is 2160 copies, not 8 M
@@ -439,7 +448,7 @@ impl Chain {
                     out[y * row..][..n].copy_from_slice(&src[o..o + n]);
                 }
             }
-            return out;
+            return;
         }
         // `element_at` (`Layout::offset_z`) split: what depends on x alone once per level, what
         // depends on y (and the slice) once per row – per element only two lookups and an XOR.
@@ -447,25 +456,80 @@ impl Chain {
         // textures the CPU writes.
         let hi = |tab: &[u32], c: usize, b: usize| tab[(c / b) % tab.len()];
         let pitch_blocks = l.pitch.div_ceil(t.block_w);
+        let base_xor = t.base_xor as u32;
         let columns: Vec<(usize, u32)> = (0..l.width)
             .map(|x| {
                 let x = x + l.origin.0;
-                (x / t.block_w, t.ox[x % t.block_w] ^ hi(&t.hx, x, t.block_w))
+                (l.offset + (x / t.block_w) * t.block_bytes, t.ox[x % t.block_w] ^ hi(&t.hx, x, t.block_w) ^ base_xor)
             })
             .collect();
         let z = t.oz[slice % t.block_d] ^ hi(&t.hz, slice, t.block_d);
-        for (y, row) in out.chunks_exact_mut(l.width * e).enumerate() {
-            let y = y + l.origin.1;
-            let row_blocks = (y / t.block_h) * pitch_blocks;
-            let yz = t.oy[y % t.block_h] ^ hi(&t.hy, y, t.block_h) ^ z;
-            for (&(block_x, x), dst) in columns.iter().zip(row.chunks_exact_mut(e)) {
-                let o = l.offset + (row_blocks + block_x) * t.block_bytes + ((x ^ yz) as usize ^ t.base_xor);
-                if let Some(s) = src.get(o..o + e) {
-                    dst.copy_from_slice(s);
+        let row_bytes = l.width * e;
+        let block_h = t.block_h;
+        let block_bytes = t.block_bytes;
+        let origin_y = l.origin.1;
+        let src_len = src.len();
+        let src_ptr = src.as_ptr();
+        for (dy, row) in out.chunks_exact_mut(row_bytes).enumerate() {
+            let y = dy + origin_y;
+            let row_off = (y / block_h) * pitch_blocks * block_bytes;
+            let yz = t.oy[y % block_h] ^ hi(&t.hy, y, block_h) ^ z;
+            match e {
+                1 => {
+                    for (&(col_off, cx), d) in columns.iter().zip(row.iter_mut()) {
+                        let o = row_off + col_off + ((cx ^ yz) as usize);
+                        if o < src_len {
+                            // SAFETY: `o < src_len == src.len()`.
+                            *d = unsafe { *src_ptr.add(o) };
+                        }
+                    }
+                }
+                2 => {
+                    for (&(col_off, cx), dst) in columns.iter().zip(row.chunks_exact_mut(2)) {
+                        let o = row_off + col_off + ((cx ^ yz) as usize);
+                        if o + 2 <= src_len {
+                            // SAFETY: `o + 2 <= src.len()`.
+                            unsafe { std::ptr::copy_nonoverlapping(src_ptr.add(o), dst.as_mut_ptr(), 2) };
+                        }
+                    }
+                }
+                4 => {
+                    for (&(col_off, cx), dst) in columns.iter().zip(row.chunks_exact_mut(4)) {
+                        let o = row_off + col_off + ((cx ^ yz) as usize);
+                        if o + 4 <= src_len {
+                            // SAFETY: `o + 4 <= src.len()`.
+                            unsafe { std::ptr::copy_nonoverlapping(src_ptr.add(o), dst.as_mut_ptr(), 4) };
+                        }
+                    }
+                }
+                8 => {
+                    for (&(col_off, cx), dst) in columns.iter().zip(row.chunks_exact_mut(8)) {
+                        let o = row_off + col_off + ((cx ^ yz) as usize);
+                        if o + 8 <= src_len {
+                            // SAFETY: `o + 8 <= src.len()`.
+                            unsafe { std::ptr::copy_nonoverlapping(src_ptr.add(o), dst.as_mut_ptr(), 8) };
+                        }
+                    }
+                }
+                16 => {
+                    for (&(col_off, cx), dst) in columns.iter().zip(row.chunks_exact_mut(16)) {
+                        let o = row_off + col_off + ((cx ^ yz) as usize);
+                        if o + 16 <= src_len {
+                            // SAFETY: `o + 16 <= src.len()`.
+                            unsafe { std::ptr::copy_nonoverlapping(src_ptr.add(o), dst.as_mut_ptr(), 16) };
+                        }
+                    }
+                }
+                _ => {
+                    for (&(col_off, cx), dst) in columns.iter().zip(row.chunks_exact_mut(e)) {
+                        let o = row_off + col_off + ((cx ^ yz) as usize);
+                        if let Some(s) = src.get(o..o + e) {
+                            dst.copy_from_slice(s);
+                        }
+                    }
                 }
             }
         }
-        out
     }
 
     /// linear rows of level `i` → its place in array slice `slice` (`dst`, `slice_bytes` long)

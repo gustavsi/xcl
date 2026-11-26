@@ -941,9 +941,40 @@ pub fn gpu_view_map_gen() -> u64 {
 
 /// Pages are mapped or unmapped at `va`: a GPU view's mappings changed if it lies in one.
 fn note_mapping_at(va: usize) {
-    if mirrors::source(va).is_some() {
-        GPU_VIEW_MAP_GEN.fetch_add(1, Ordering::Release);
+    note_mapping_range(va, PHYS_PAGE);
+}
+
+/// The address ranges of the last mapping changes inside GPU views with the generation each made
+/// (`gpu_view_map_gen`), oldest first, and the newest generation dropped from the front (`0`:
+/// none): a reader that has seen generation n looks at the ranges with a later one.
+static GPU_VIEW_MAP_LOG: std::sync::Mutex<(u64, std::collections::VecDeque<(u64, usize, usize)>)> =
+    std::sync::Mutex::new((0, std::collections::VecDeque::new()));
+const MAP_LOG: usize = 4096;
+
+/// Pages are mapped or unmapped in `[lo, lo + len)`.
+fn note_mapping_range(lo: usize, len: usize) {
+    if len == 0 || (mirrors::source(lo).is_none() && mirrors::source(lo + len - 1).is_none()) {
+        return;
     }
+    let mut g = GPU_VIEW_MAP_LOG.lock().unwrap();
+    let gen = GPU_VIEW_MAP_GEN.load(Ordering::Relaxed) + 1;
+    g.1.push_back((gen, lo, lo.saturating_add(len)));
+    if g.1.len() > MAP_LOG {
+        if let Some((dropped, _, _)) = g.1.pop_front() {
+            g.0 = dropped;
+        }
+    }
+    GPU_VIEW_MAP_GEN.store(gen, Ordering::Release);
+}
+
+/// The ranges whose mappings in GPU views changed after generation `since`, or None when the log
+/// no longer has them all.
+pub fn gpu_view_map_changes(since: u64) -> Option<Vec<(usize, usize)>> {
+    let g = GPU_VIEW_MAP_LOG.lock().unwrap();
+    if since < g.0 {
+        return None;
+    }
+    Some(g.1.iter().filter(|e| e.0 > since).map(|e| (e.1, e.2)).collect())
 }
 
 /// Page numbers count 4 KiB frames, as on the console: a 64 KiB page's is a multiple of 16 (a retail game
@@ -1388,7 +1419,7 @@ pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _
 /// `MapTitlePhysicalPages` with `AWAY` held; the homes it moves away are given back by the
 /// caller (`give_back_homes`).
 unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize) -> *mut c_void {
-    note_mapping_at(va as usize);
+    note_mapping_range(va as usize, n.saturating_mul(PHYS_PAGE));
     if crate::gpu::uma::get().is_none() || n == 0 || (va.is_null() && arr.is_null()) {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();

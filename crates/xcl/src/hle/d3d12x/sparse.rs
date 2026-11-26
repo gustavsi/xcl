@@ -1365,6 +1365,21 @@ unsafe impl Send for QueueWait {}
 
 static RB_QUEUES: Mutex<Option<FxHashMap<usize, RbQueueState>>> = Mutex::new(None);
 static QUEUE_WAITS: Mutex<Option<FxHashMap<usize, Vec<QueueWait>>>> = Mutex::new(None);
+/// Serializes readback staging buffer (`rb_alloc` / `rb_list` / `rb_buf`) across async readback
+/// workers without holding `STATE` across the GPU fence wait.
+static RB_EXEC_LOCK: Mutex<()> = Mutex::new(());
+
+/// Update sparse `sent` hashes after `cpu_writes` stores GPU-written immediate/timestamp values
+/// into a sparse window's CPU view so `before_execute` does not re-upload them.
+pub(super) unsafe fn sync_sent_if_sparse(va: usize, len: usize) {
+    if len == 0 || !crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va)) {
+        return;
+    }
+    let mut g = STATE.lock().unwrap();
+    if let Some(s) = g.as_mut() {
+        s.sync_sent_range(va, len);
+    }
+}
 
 /// Record an active GPU `queue.Wait(&fence, value)` on `queue` so `readback_after_execute`
 /// knows when `queue` is blocked on an unsatisfied fence and must dispatch asynchronously.
@@ -1378,7 +1393,7 @@ pub unsafe fn note_queue_wait(queue: usize, fence: ID3D12Fence, value: u64) {
     v.push(QueueWait(fence, value));
 }
 
-unsafe fn queue_has_unsatisfied_wait(queue: usize) -> bool {
+pub(super) unsafe fn queue_has_unsatisfied_wait(queue: usize) -> bool {
     let mut g = QUEUE_WAITS.lock().unwrap();
     let Some(m) = g.as_mut() else { return false };
     let Some(v) = m.get_mut(&queue) else { return false };
@@ -1420,6 +1435,105 @@ unsafe fn wait_fence_ms(fence: &ID3D12Fence, target: u64, event: HANDLE, timeout
     true
 }
 
+/// Run `readback_ranges` from an async worker without holding `STATE` during the GPU copy wait,
+/// so the render thread's `before_execute` never stalls on readback fence completion.
+unsafe fn readback_ranges_unlocked(ranges: &[(usize, usize)], event: HANDLE) {
+    let _rb_guard = RB_EXEC_LOCK.lock().unwrap();
+    // Process in chunks fitting `READBACK_STAGING` so each GPU wait happens outside `STATE`.
+    let mut idx = 0usize;
+    let mut off_in_range = 0usize;
+    while idx < ranges.len() {
+        let wait_prev = {
+            let g = STATE.lock().unwrap();
+            g.as_ref().and_then(|s| (s.fence.GetCompletedValue() < s.rb_last_fence).then(|| (s.fence.clone(), s.rb_last_fence)))
+        };
+        if let Some((f, v)) = wait_prev {
+            wait_fence_ms(&f, v, event, 5000);
+        }
+        let (pending, fence_and_val, rb_ptr): (Vec<(usize, usize, usize)>, Option<(ID3D12Fence, u64)>, usize) = {
+            let mut g = STATE.lock().unwrap();
+            let Some(s) = g.as_mut() else { return };
+            let Some((rb, p)) = s.readback_buf() else { return };
+            let mut pending = Vec::new();
+            let mut used = 0usize;
+            let mut open = false;
+            while idx < ranges.len() && used < READBACK_STAGING {
+                let (a, n) = ranges[idx];
+                if off_in_range >= n {
+                    idx += 1;
+                    off_in_range = 0;
+                    continue;
+                }
+                let cur = a + off_in_range;
+                let tile = cur & !(TILE - 1);
+                let Some(wi) = s.window_index(cur) else {
+                    idx += 1;
+                    off_in_range = 0;
+                    continue;
+                };
+                let b = s.windows[wi].0;
+                let to_tile_end = (tile + TILE) - cur;
+                if !s.mapped.contains_key(&tile) {
+                    off_in_range += (n - off_in_range).min(to_tile_end);
+                    continue;
+                }
+                let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
+                let chunk = (n - off_in_range).min(READBACK_STAGING - used).min(to_tile_end).min(to_win_end);
+                if !open {
+                    let _ = s.rb_alloc.Reset();
+                    let _ = s.rb_list.Reset(&s.rb_alloc, None);
+                    open = true;
+                }
+                s.rb_list.CopyBufferRegion(&rb, used as u64, &s.windows[wi].1, (cur - b) as u64, chunk as u64);
+                pending.push((cur, used, chunk));
+                used += chunk;
+                off_in_range += chunk;
+            }
+            let fv = if open {
+                if s.rb_list.Close().is_ok() {
+                    if let Ok(l) = s.rb_list.cast::<ID3D12CommandList>() {
+                        super::title_textures::own_work(|| {
+                            s.queue.ExecuteCommandLists(&[Some(l)]);
+                        });
+                    }
+                }
+                s.signal();
+                s.rb_last_fence = s.value;
+                Some((s.fence.clone(), s.value))
+            } else {
+                None
+            };
+            (pending, fv, p as usize)
+        };
+        if let Some((f, v)) = fence_and_val {
+            wait_fence_ms(&f, v, event, 5000);
+        }
+        if !pending.is_empty() {
+            let p = rb_ptr as *const u8;
+            let mut g = STATE.lock().unwrap();
+            let Some(s) = g.as_mut() else { return };
+            s.reclaim_ring();
+            for &(dst, off, len) in &pending {
+                let mut at = dst;
+                let mut src_off = off;
+                let end = dst + len;
+                while at < end {
+                    let pg = at & !(PAGE - 1);
+                    let t = pg & !(TILE - 1);
+                    let idx_p = (pg - t) / PAGE;
+                    let step = (pg + PAGE).min(end) - at;
+                    if s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx_p) == 0) {
+                        std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
+                    }
+                    at += step;
+                    src_off += step;
+                }
+                s.sync_sent_range(dst, len);
+            }
+        }
+    }
+}
+
 fn spawn_rb_worker(queue_id: usize) -> std::sync::mpsc::Sender<RbJob> {
     let (tx, rx) = std::sync::mpsc::channel::<RbJob>();
     let name = format!("xcl-sparse-rb-{queue_id:x}");
@@ -1432,10 +1546,7 @@ fn spawn_rb_worker(queue_id: usize) -> std::sync::mpsc::Sender<RbJob> {
             // a queue may carry a wait-before-signal `Wait64BitValueX` whose producer has not
             // been submitted yet on the caller's thread.
             if wait_fence_ms(&job.fence, job.value, event, 5000) {
-                let mut g = STATE.lock().unwrap();
-                if let Some(s) = g.as_mut() {
-                    s.readback_ranges(&job.ranges);
-                }
+                readback_ranges_unlocked(&job.ranges, event);
             } else {
                 static LATE: AtomicU64 = AtomicU64::new(0);
                 let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;

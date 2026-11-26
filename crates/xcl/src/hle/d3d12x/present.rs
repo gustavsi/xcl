@@ -49,18 +49,26 @@ static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
 static PRESENTX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PRESENTX_LOCK: Mutex<()> = Mutex::new(());
 
+static PRESENTX_NS: AtomicU64 = AtomicU64::new(0);
+
+pub fn present_x_ns() -> u64 {
+    PRESENTX_NS.load(Ordering::Relaxed)
+}
+
 /// command queue #30 PresentX(planeCount, planes, parameters): plane 0's first resource is
 /// the frame; S_OK always (a console present does not fail for the title).
 pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
     if plane_count == 0 || planes.is_null() || !crate::gpu::shader::readable(planes as usize, 0x18) {
         return 0;
     }
+    let t0 = std::time::Instant::now();
     let token = (planes as *const u64).read_unaligned();
     let _present = PRESENTX_LOCK.lock().unwrap();
     present_x_frame(queue, plane_count, planes);
     // The title can use flip statistics to decide when to reuse its buffer.
     // Queue our copy before reporting the flip.
     super::frame::mark_flipped(token);
+    PRESENTX_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     0
 }
 
@@ -303,6 +311,11 @@ pub fn known_queues() -> Vec<usize> {
 }
 
 static EXECUTES: AtomicU64 = AtomicU64::new(0);
+
+/// XCL is presenting on this thread (its own copy of the frame is being submitted).
+pub(super) fn presenting() -> bool {
+    IN_PRESENT.with(|c| c.get())
+}
 
 /// (PresentX calls, ExecuteCommandLists calls) so far
 pub fn activity() -> (u64, u64) {

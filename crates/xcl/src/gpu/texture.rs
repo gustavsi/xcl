@@ -278,19 +278,7 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         None => Uploader::new(dev)?,
     };
     // where each texture's texels go in the upload buffer
-    let mut failed = Vec::new();
-    let mut planned = Vec::with_capacity(items.len());
-    let mut total = 0u64;
-    for (k, (res, subs, states)) in items.iter().enumerate() {
-        match layout(dev, res, subs, states, states) {
-            Ok(l) => {
-                let base = total.div_ceil(PLACEMENT) * PLACEMENT;
-                total = base + l.total;
-                planned.push((k, l, base));
-            }
-            Err(e) => failed.push((k, e)),
-        }
-    }
+    let (failed, planned, total) = plan_batch(dev, items);
     if planned.is_empty() {
         put_back(key, up);
         return Ok(failed);
@@ -315,6 +303,90 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     }
     put_back(key, up);
     Ok(failed)
+}
+
+unsafe fn plan_batch(dev: &ID3D12Device, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> (Vec<(usize, String)>, Vec<(usize, Layout, u64)>, u64) {
+    let mut failed = Vec::new();
+    let mut planned = Vec::with_capacity(items.len());
+    let mut total = 0u64;
+    for (k, (res, subs, states)) in items.iter().enumerate() {
+        match layout(dev, res, subs, states, states) {
+            Ok(l) => {
+                let base = total.div_ceil(PLACEMENT) * PLACEMENT;
+                total = base + l.total;
+                planned.push((k, l, base));
+            }
+            Err(e) => failed.push((k, e)),
+        }
+    }
+    (failed, planned, total)
+}
+
+/// A reusable command list + allocator + persistently mapped staging buffer for non-blocking
+/// batches submitted directly on a DIRECT queue (`submit_batch_with_slot`).
+pub struct UploadSlot {
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    staging: Option<(ID3D12Resource, *mut u8, u64)>,
+    pub bytes: u64,
+}
+
+unsafe impl Send for UploadSlot {}
+
+impl UploadSlot {
+    unsafe fn new(dev: &ID3D12Device) -> Result<Self, String> {
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
+        list.Close().map_err(err)?;
+        Ok(Self { alloc, list, staging: None, bytes: 0 })
+    }
+
+    unsafe fn staging(&mut self, dev: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, *mut u8), String> {
+        if let Some((b, p, cap)) = &self.staging {
+            if *cap >= bytes {
+                return Ok((b.clone(), *p));
+            }
+        }
+        let cap = staging_capacity(bytes).ok_or("texture upload buffer size overflow")?;
+        drop(self.staging.take());
+        let b = buffer(dev, cap)?;
+        let mut p = std::ptr::null_mut();
+        b.Map(0, None, Some(&mut p)).map_err(err)?;
+        self.staging = Some((b.clone(), p as *mut u8, cap));
+        Ok((b, p as *mut u8))
+    }
+
+    pub fn staging_cap(&self) -> u64 {
+        self.staging.as_ref().map_or(0, |s| s.2)
+    }
+}
+
+/// Record and execute `items` on `queue` without waiting on the CPU, reusing `slot` when given.
+pub unsafe fn submit_batch_with_slot(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)],
+    slot: Option<UploadSlot>,
+) -> Result<(Vec<(usize, String)>, Option<UploadSlot>), String> {
+    let (failed, planned, bytes) = plan_batch(dev, items);
+    if planned.is_empty() {
+        return Ok((failed, None));
+    }
+    let mut slot = match slot {
+        Some(s) => s,
+        None => UploadSlot::new(dev)?,
+    };
+    let (staging, mapped) = slot.staging(dev, bytes)?;
+    slot.alloc.Reset().map_err(err)?;
+    slot.list.Reset(&slot.alloc, None).map_err(err)?;
+    for (k, layout, base) in &planned {
+        let (res, subs, states) = &items[*k];
+        record_into(&slot.list, res, subs, layout, states, states, &staging, mapped, *base);
+    }
+    slot.list.Close().map_err(err)?;
+    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&slot.list).map_err(err)?)]);
+    slot.bytes = bytes;
+    Ok((failed, Some(slot)))
 }
 
 fn put_back(key: usize, up: Uploader) {

@@ -673,7 +673,7 @@ pub(super) enum Deferred {
 }
 
 impl ListState {
-    fn note_write(&mut self, va: u64, size: u64) {
+    fn note_write_no_readback(&mut self, va: u64, size: u64) {
         if size == 0 {
             return;
         }
@@ -686,6 +686,15 @@ impl ListState {
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
             unsafe { super::sparse::ensure_lazy_mapped(va as usize, size as usize) };
+        }
+    }
+
+    fn note_write(&mut self, va: u64, size: u64) {
+        if size == 0 {
+            return;
+        }
+        self.note_write_no_readback(va, size);
+        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
             if self.sparse_writes.is_empty() {
                 SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
             }
@@ -1044,6 +1053,10 @@ fn pick_queue(last_queue: Option<usize>, device: usize, ty: D3D12_COMMAND_LIST_T
 
 fn note_write(list: usize, va: u64, size: u64) {
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
+}
+
+fn note_write_no_readback(list: usize, va: u64, size: u64) {
+    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write_no_readback(va, size);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2502,7 +2515,17 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         }
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     };
-    note_write(list as usize, va, n);
+    if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
+        // Immediate Write32/64 into a sparse window: write to VRAM on GPU AND propagate the
+        // known constant to CPU memory via `cpu_writes` once the queue fence completes, avoiding
+        // a synchronous full-queue `sparse::readback_after_execute` GPU drain on every submit.
+        note_write_no_readback(list as usize, va, n);
+        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+            s.cpu_writes.push(super::cpu_writes::Write::Immediate(va as usize, words.to_vec()));
+        }
+    } else {
+        note_write(list as usize, va, n);
+    }
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
     let modes = vec![mode; words.len()];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
@@ -2582,10 +2605,16 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
                 }
             }
         };
-        let rb = if uma_dst.is_none() {
+        let is_sparse_dst = uma_dst.is_some() && crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize));
+        let rb = if uma_dst.is_none() || is_sparse_dst {
             match ensure_timestamp_readback(&dev, pool) {
                 Some(rb) => Some(rb),
-                None => return warn(&N, what, format_args!("no timestamp readback buffer")),
+                None => {
+                    if uma_dst.is_none() {
+                        return warn(&N, what, format_args!("no timestamp readback buffer"));
+                    }
+                    None
+                }
             }
         } else {
             None
@@ -2595,6 +2624,21 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
     let i = NEXT_TIMESTAMP.fetch_add(1, Ordering::Relaxed) % TIMESTAMP_SLOTS;
     type Resolve = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
     if let Some((d, off)) = uma_dst {
+        let is_sparse_dst = crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize));
+        if is_sparse_dst {
+            if let Some((rb, base)) = readback {
+                note_write_no_readback(list as usize, va, 8);
+                let rb_raw = rb.as_raw() as usize;
+                let rb_off = i as u64 * 8;
+                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+                    s.cpu_writes.push(super::cpu_writes::Write::ReadbackU64 { va: va as usize, src: base + rb_off as usize, _buf: rb });
+                }
+                pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
+                as_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
+                pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, rb_raw, rb_off);
+                return;
+            }
+        }
         note_write(list as usize, va, 8);
         pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
         as_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));

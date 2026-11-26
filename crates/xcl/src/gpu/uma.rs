@@ -376,16 +376,21 @@ impl Uma {
         self.window_of(p).is_some_and(|k| self.is_sparse_window(k))
     }
 
-    /// Whether `p` is in a committed window.
+    /// Whether `p` is in a committed window (within its committed byte length).
     pub fn is_committed(&self, p: usize) -> bool {
-        self.window_of(p).is_some_and(|k| self.is_committed_window(k))
+        let Some(k) = self.window_of(p) else { return false };
+        let Some(WindowKind::Committed(c_size)) = self.kinds.get(k) else { return false };
+        p - (self.base + k * WINDOW) < *c_size
     }
 
     /// Whether `[p, p + len)` lies in a committed coherent window – memory that is committed and
     /// read-write as a whole, so it needs no `VirtualQuery` (which walks a region to its end to
     /// size it: on a 4 GiB window ~40 ms a call, a retail game's DirectStorage requests crawled).
     pub fn in_committed_window(&self, p: usize, len: usize) -> bool {
-        len > 0 && self.is_committed(p) && p.checked_add(len - 1).is_some_and(|e| self.window_of(e) == self.window_of(p))
+        let Some(k) = self.window_of(p) else { return false };
+        let Some(WindowKind::Committed(c_size)) = self.kinds.get(k) else { return false };
+        let off = p - (self.base + k * WINDOW);
+        len > 0 && off.checked_add(len).is_some_and(|end| end <= *c_size)
     }
 
     /// Address space for a title reservation of `size` bytes in the sparse windows (64 KiB
