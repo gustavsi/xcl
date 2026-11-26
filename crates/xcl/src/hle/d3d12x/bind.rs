@@ -1710,7 +1710,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     views[0] = va(io_at);
     views[1] = va(res_at);
     for k in 0..4 {
-        views[2 + k] = windows.get(k).copied().unwrap_or(first);
+        views[2 + k] = windows.get(k).copied().filter(|&v| v != 0).unwrap_or(first);
     }
     let real = real as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?.clone();
