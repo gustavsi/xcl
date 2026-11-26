@@ -1475,7 +1475,7 @@ unsafe fn submit_on_title_queue(dev: &ID3D12Device, queue: &ID3D12CommandQueue, 
     let mut g = ON_QUEUE.lock().unwrap();
     let key = queue.as_raw() as usize;
     if !g.contains_key(&key) {
-        match dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+        match super::real::create_raw_fence(&dev) {
             Ok(fence) => {
                 g.insert(key, QueueUploads { fence, value: 0, in_flight: std::collections::VecDeque::new(), bytes: 0 });
             }

@@ -1731,6 +1731,9 @@ pub unsafe fn readback_now(va: usize, len: usize) {
                 waited_title_queues = true;
             }
             super::title_textures::own_work(|| {
+                // the job's list is made through the adopted device; `rb_queue` is XCL's own,
+                // so vkd3d-proton needs the list's native vtable for this submit (Wine)
+                let _native = super::real::UnadoptGuard::new(cmd_list.as_raw());
                 s.rb_queue.ExecuteCommandLists(&[Some(cmd_list)]);
             });
             s.signal_rb();
@@ -2003,7 +2006,7 @@ impl State {
         for (key, q) in active {
             let entry = match self.queue_fences.entry(key) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => match self.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+                std::collections::hash_map::Entry::Vacant(e) => match super::real::create_raw_fence(&self.dev) {
                     Ok(fence) => e.insert((fence, 0)),
                     Err(_) => return None,
                 },

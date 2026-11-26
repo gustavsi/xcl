@@ -293,9 +293,7 @@ unsafe fn init_state(device: &ID3D12Device) -> Result<HeartbeatState, String> {
     };
     let slots = [make_slot()?, make_slot()?];
 
-    let fence: ID3D12Fence = device
-        .CreateFence(0, D3D12_FENCE_FLAG_NONE)
-        .map_err(|e| format!("CreateFence failed: {e}"))?;
+    let fence: ID3D12Fence = super::real::create_raw_fence(device).map_err(|e| format!("CreateFence failed: {e}"))?;
     let event = EventGuard::new()?;
 
     Ok(HeartbeatState {

@@ -2365,7 +2365,7 @@ unsafe fn signal_device_queues(
     let rq = map.entry(dev_key).or_insert_with(RetireQueue::new);
     rq.signal_queues_with(
         &queues,
-        || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok(),
+        || super::real::create_raw_fence(&dev).ok(),
         |q, f, v| q.Signal(f, v).is_ok(),
     )
 }

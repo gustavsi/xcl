@@ -237,7 +237,7 @@ unsafe fn signal_live_queues_for(dev: &ID3D12Device) -> Option<Vec<(ID3D12Fence,
         let (fence, val) = match map.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
-                let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+                let f: ID3D12Fence = super::real::create_raw_fence(&dev).ok()?;
                 e.insert((f, 0))
             }
         };
